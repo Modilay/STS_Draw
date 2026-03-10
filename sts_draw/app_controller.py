@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sts_draw.draw_executor import DrawExecutor
-from sts_draw.gemini_client import GeminiClient
+from sts_draw.image_generation_client import OpenAICompatibleClient
 from sts_draw.models import CalibrationRegion, ExecutionSession, StrokePlan
 from sts_draw.preview_renderer import PreviewRenderer
 from sts_draw.stroke_planner import StrokePlanner
@@ -38,13 +38,14 @@ class LineArtMatrixFactory:
 class AppController:
     def __init__(
         self,
-        gemini_client: GeminiClient,
+        gemini_client: OpenAICompatibleClient,
         stroke_planner: StrokePlanner,
         preview_renderer: PreviewRenderer,
         draw_executor: DrawExecutor,
         line_art_matrix_factory: LineArtMatrixFactory | None = None,
     ) -> None:
         self.gemini_client = gemini_client
+        self.image_generation_client = gemini_client
         self.stroke_planner = stroke_planner
         self.preview_renderer = preview_renderer
         self.draw_executor = draw_executor
@@ -58,7 +59,7 @@ class AppController:
     def generate_line_art(self) -> None:
         if not self.session.image_path:
             raise RuntimeError("No image has been selected.")
-        self.session.line_art = self.gemini_client.generate_line_art(self.session.image_path)
+        self.session.line_art = self.image_generation_client.generate_line_art(self.session.image_path)
         self.session.status = "line_art_ready"
 
     def set_region(self, region: CalibrationRegion) -> None:

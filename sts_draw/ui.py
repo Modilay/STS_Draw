@@ -1,124 +1,709 @@
 from __future__ import annotations
 
+import tempfile
+import uuid
 from pathlib import Path
 
 from sts_draw.app_controller import AppController
 from sts_draw.canvas_calibrator import CanvasCalibrator
 from sts_draw.global_hotkeys import GlobalHotkeyManager
+from sts_draw.user_settings import UserSettings, UserSettingsStore
 
 
 class MainWindowFactory:
-    def create(self, controller: AppController, calibrator: CanvasCalibrator, hotkeys: GlobalHotkeyManager):
+    def create(
+        self,
+        controller: AppController,
+        calibrator: CanvasCalibrator,
+        hotkeys: GlobalHotkeyManager,
+        settings_store: UserSettingsStore | None = None,
+    ):
         try:
-            from PySide6 import QtWidgets
+            from PySide6 import QtCore, QtGui, QtWidgets
         except ImportError as exc:
             raise RuntimeError("PySide6 is not installed.") from exc
 
+        settings_store = settings_store or UserSettingsStore()
+        saved_settings = settings_store.load()
+        controller.session.hotkeys.update(saved_settings.hotkeys)
+        controller.session.draw_mouse_button = saved_settings.draw_mouse_button
+
+        class ClickablePreviewLabel(QtWidgets.QLabel):
+            clicked = QtCore.Signal()
+
+            def mousePressEvent(self, event) -> None:
+                if event.button() == QtCore.Qt.LeftButton:
+                    self.clicked.emit()
+                super().mousePressEvent(event)
+
         class MainWindow(QtWidgets.QMainWindow):
+            hotkey_action_requested = QtCore.Signal(str)
             def __init__(self) -> None:
                 super().__init__()
-                self.setWindowTitle("STS Draw")
-                self.resize(720, 420)
+                self.setWindowTitle("STS 绘图助手")
+                self.resize(1120, 760)
+                self._controller = controller
+                self._hotkeys_manager = hotkeys
+                self._settings_store = settings_store
+                self._original_pixmap: QtGui.QPixmap | None = None
+                self._line_art_pixmap: QtGui.QPixmap | None = None
+                self._recording_hotkey_name: str | None = None
+                self._hotkey_titles = {
+                    "calibrate": "定位预览",
+                    "start": "开始绘制",
+                    "stop": "停止绘制",
+                }
 
                 central = QtWidgets.QWidget()
-                layout = QtWidgets.QVBoxLayout(central)
-                self.status_label = QtWidgets.QLabel("Idle")
-                self.image_label = QtWidgets.QLabel("No image selected")
-                self.api_key_input = QtWidgets.QLineEdit()
-                self.api_key_input.setPlaceholderText("Gemini API Key")
-                self.api_key_input.setEchoMode(QtWidgets.QLineEdit.Password)
-                browse_button = QtWidgets.QPushButton("Select image")
-                line_art_button = QtWidgets.QPushButton("Generate line art")
-                calibrate_button = QtWidgets.QPushButton("Select region")
-                preview_button = QtWidgets.QPushButton("Preview")
-                start_button = QtWidgets.QPushButton("Start drawing")
+                self.root_layout = QtWidgets.QVBoxLayout(central)
+                self.root_layout.setObjectName("root_layout")
+                self.root_layout.setContentsMargins(24, 24, 24, 24)
+                self.root_layout.setSpacing(20)
 
-                layout.addWidget(self.status_label)
-                layout.addWidget(self.image_label)
-                layout.addWidget(self.api_key_input)
-                layout.addWidget(browse_button)
-                layout.addWidget(line_art_button)
-                layout.addWidget(calibrate_button)
-                layout.addWidget(preview_button)
-                layout.addWidget(start_button)
+                self._apply_styles()
+                self.hotkey_action_requested.connect(self._handle_hotkey_action)
+
+                self.preview_panel = self._create_card("preview_panel", "图片预览", "上方直接对比原图与线稿效果。")
+                preview_layout = QtWidgets.QHBoxLayout()
+                preview_layout.setSpacing(16)
+                self.preview_panel.layout().addLayout(preview_layout)
+
+                original_card, self.original_preview_label = self._create_preview_card(
+                    "原图预览",
+                    "original_preview",
+                    "点击选择图片 / Ctrl+V 粘贴图片",
+                    clickable=True,
+                )
+                line_art_card, self.line_art_preview_label = self._create_preview_card(
+                    "线稿预览",
+                    "line_art_preview",
+                    "生成线稿后会显示在这里",
+                )
+                preview_layout.addWidget(original_card, 1)
+                preview_layout.addWidget(line_art_card, 1)
+
+                self.control_panel = self._create_card("control_panel", "控制面板", "下方完成配置、生成、校准和绘制。")
+                control_layout = QtWidgets.QHBoxLayout()
+                control_layout.setSpacing(16)
+                self.control_panel.layout().addLayout(control_layout)
+
+                config_card = self._create_card("config_panel", "模型配置", "导入图片后即可生成线稿。")
+                self.image_name_value_label = QtWidgets.QLabel("未选择图片")
+                self.image_name_value_label.setObjectName("image_name_value")
+                self.api_key_input = QtWidgets.QLineEdit()
+                self.api_key_input.setPlaceholderText("输入 OpenRouter 或兼容服务的 API Key")
+                self.api_key_input.setEchoMode(QtWidgets.QLineEdit.Password)
+                self.model_input = QtWidgets.QLineEdit()
+                self.model_input.setPlaceholderText("输入模型名称")
+                self.model_input.setText(controller.image_generation_client.settings.model)
+                self.base_url_input = QtWidgets.QLineEdit()
+                self.base_url_input.setPlaceholderText("输入接口地址")
+                self.base_url_input.setText(controller.image_generation_client.settings.base_url)
+                self.proxy_input = QtWidgets.QLineEdit()
+                self.proxy_input.setPlaceholderText("输入 HTTP(S) 代理地址")
+                self.proxy_input.setText(controller.image_generation_client.settings.proxy_url or "")
+                self.fill_proxy_button = QtWidgets.QPushButton("填入 7890")
+                self.fill_proxy_button.setObjectName("compact_button")
+                self.hotkey_value_labels: dict[str, QtWidgets.QLabel] = {}
+                self.hotkey_record_buttons: dict[str, QtWidgets.QPushButton] = {}
+                self.mouse_button_combo = QtWidgets.QComboBox()
+                self.mouse_button_combo.addItem("左键", "left")
+                self.mouse_button_combo.addItem("右键", "right")
+                self.mouse_button_combo.setCurrentIndex(
+                    0 if controller.session.draw_mouse_button == "left" else 1
+                )
+                self._paste_aware_inputs = (
+                    self.api_key_input,
+                    self.model_input,
+                    self.base_url_input,
+                    self.proxy_input,
+                )
+                for input_widget in self._paste_aware_inputs:
+                    input_widget.installEventFilter(self)
+                form_layout = QtWidgets.QFormLayout()
+                form_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                form_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                form_layout.setHorizontalSpacing(10)
+                form_layout.setVerticalSpacing(10)
+                form_layout.addRow("当前图片", self.image_name_value_label)
+                form_layout.addRow("API Key", self.api_key_input)
+                form_layout.addRow("模型", self.model_input)
+                form_layout.addRow("接口地址", self.base_url_input)
+                proxy_row = QtWidgets.QWidget()
+                proxy_row_layout = QtWidgets.QHBoxLayout(proxy_row)
+                proxy_row_layout.setContentsMargins(0, 0, 0, 0)
+                proxy_row_layout.setSpacing(8)
+                proxy_row_layout.addWidget(self.proxy_input, 1)
+                proxy_row_layout.addWidget(self.fill_proxy_button)
+                form_layout.addRow("代理地址", proxy_row)
+                config_card.layout().addLayout(form_layout)
+                config_card.layout().addStretch(1)
+                self.shortcut_card = self._create_card("shortcut_panel", "快捷与绘制", "在这里调整全局热键和绘制按键。")
+                hotkey_form = QtWidgets.QFormLayout()
+                hotkey_form.setLabelAlignment(QtCore.Qt.AlignLeft)
+                hotkey_form.setFormAlignment(QtCore.Qt.AlignTop)
+                hotkey_form.setHorizontalSpacing(10)
+                hotkey_form.setVerticalSpacing(10)
+                for action in ("calibrate", "start", "stop"):
+                    value_label = QtWidgets.QLabel()
+                    value_label.setObjectName("hotkey_value")
+                    button = QtWidgets.QPushButton("设置")
+                    button.setObjectName("compact_button")
+                    button.clicked.connect(lambda _checked=False, name=action: self._begin_hotkey_recording(name))
+                    row_widget = QtWidgets.QWidget()
+                    row_layout = QtWidgets.QHBoxLayout(row_widget)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    row_layout.setSpacing(8)
+                    row_layout.addWidget(value_label, 1)
+                    row_layout.addWidget(button)
+                    hotkey_form.addRow(self._hotkey_titles[action], row_widget)
+                    self.hotkey_value_labels[action] = value_label
+                    self.hotkey_record_buttons[action] = button
+                hotkey_form.addRow("绘画按键", self.mouse_button_combo)
+                self.shortcut_card.layout().addLayout(hotkey_form)
+                self.shortcut_card.layout().addStretch(1)
+
+                actions_card = self._create_card("actions_panel", "操作", "生成线稿后定位预览，再开始绘制。")
+                actions_grid = QtWidgets.QGridLayout()
+                actions_grid.setHorizontalSpacing(10)
+                actions_grid.setVerticalSpacing(10)
+                self.line_art_button = QtWidgets.QPushButton("生成线稿")
+                self.preview_button = QtWidgets.QPushButton("定位预览")
+                self.start_button = QtWidgets.QPushButton("开始绘制")
+                self.start_button.setObjectName("primary_button")
+                actions_grid.addWidget(self.line_art_button, 0, 0)
+                actions_grid.addWidget(self.preview_button, 0, 1)
+                actions_grid.addWidget(self.start_button, 1, 0, 1, 2)
+                actions_card.layout().addLayout(actions_grid)
+                hint_label = QtWidgets.QLabel("点击原图预览可选择图片，Ctrl+V 可直接粘贴；定位预览时滚轮缩放。")
+                hint_label.setObjectName("hint_label")
+                hint_label.setWordWrap(True)
+                actions_card.layout().addWidget(hint_label)
+                actions_card.layout().addStretch(1)
+
+                status_card = self._create_card("status_panel", "状态", "查看当前导入、线稿和预览状态。")
+                status_layout = QtWidgets.QFormLayout()
+                status_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
+                status_layout.setFormAlignment(QtCore.Qt.AlignTop)
+                status_layout.setHorizontalSpacing(10)
+                status_layout.setVerticalSpacing(10)
+                self.status_value_label = QtWidgets.QLabel("待开始")
+                self.status_value_label.setWordWrap(True)
+                self.status_value_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+                self.region_value_label = QtWidgets.QLabel("未选择")
+                self.preview_value_label = QtWidgets.QLabel("未生成")
+                status_layout.addRow("任务状态", self.status_value_label)
+                status_layout.addRow("绘制区域", self.region_value_label)
+                status_layout.addRow("预览结果", self.preview_value_label)
+                status_card.layout().addLayout(status_layout)
+                status_card.layout().addStretch(1)
+
+                control_layout.addWidget(config_card, 4)
+                control_layout.addWidget(self.shortcut_card, 4)
+                control_layout.addWidget(actions_card, 3)
+                control_layout.addWidget(status_card, 3)
+
+                self.root_layout.addWidget(self.preview_panel, 7)
+                self.root_layout.addWidget(self.control_panel, 4)
                 self.setCentralWidget(central)
 
-                browse_button.clicked.connect(self._browse_image)
-                line_art_button.clicked.connect(self._generate_line_art)
-                calibrate_button.clicked.connect(self._select_region)
-                preview_button.clicked.connect(self._preview)
-                start_button.clicked.connect(self._start)
+                self.original_preview_label.clicked.connect(self._browse_image)
+                self.line_art_button.clicked.connect(self._generate_line_art)
+                self.preview_button.clicked.connect(self._preview)
+                self.start_button.clicked.connect(self._start)
+                self.fill_proxy_button.clicked.connect(self._fill_local_proxy)
+                self.mouse_button_combo.currentIndexChanged.connect(self._on_draw_mouse_button_changed)
+                self._refresh_hotkey_labels()
 
-                hotkeys.register(
+                self.paste_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+V"), self)
+                self.paste_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+                self.paste_shortcut.activated.connect(self._paste_image_from_clipboard)
+
+                self._register_hotkeys()
+
+            def resizeEvent(self, event) -> None:
+                super().resizeEvent(event)
+                self._refresh_preview_pixmaps()
+
+            def keyPressEvent(self, event) -> None:
+                if self._recording_hotkey_name is not None:
+                    if event.key() == QtCore.Qt.Key_Escape:
+                        self._finish_hotkey_recording("已取消热键修改")
+                        event.accept()
+                        return
+                    hotkey = self._hotkey_from_event(event)
+                    if hotkey is None:
+                        self.status_value_label.setText("热键至少需要 Ctrl、Alt 或 Shift 加普通按键")
+                        event.accept()
+                        return
+                    duplicate_hotkeys = {
+                        value
+                        for name, value in controller.session.hotkeys.items()
+                        if name != self._recording_hotkey_name
+                    }
+                    if hotkey in duplicate_hotkeys:
+                        self.status_value_label.setText("该热键已在使用，请换一个组合键")
+                        event.accept()
+                        return
+                    action = self._recording_hotkey_name
+                    controller.session.hotkeys[action] = hotkey
+                    self._refresh_hotkey_labels()
+                    self._save_runtime_settings()
+                    self._register_hotkeys()
+                    self._finish_hotkey_recording(self._hotkey_update_status(action, hotkey))
+                    event.accept()
+                    return
+                super().keyPressEvent(event)
+
+            def eventFilter(self, watched, event) -> bool:
+                if (
+                    watched in getattr(self, "_paste_aware_inputs", ())
+                    and event.type() == QtCore.QEvent.KeyPress
+                    and event.matches(QtGui.QKeySequence.Paste)
+                ):
+                    if self._try_import_image_from_clipboard():
+                        event.accept()
+                        return True
+                return super().eventFilter(watched, event)
+
+            def _begin_hotkey_recording(self, action: str) -> None:
+                self._recording_hotkey_name = action
+                for name, button in self.hotkey_record_buttons.items():
+                    button.setText("按下快捷键" if name == action else "设置")
+                self.status_value_label.setText(f"请按下新的{self._hotkey_titles[action]}热键，Esc 取消")
+                self.grabKeyboard()
+
+            def _finish_hotkey_recording(self, status_text: str | None = None) -> None:
+                if self._recording_hotkey_name is not None:
+                    self.releaseKeyboard()
+                self._recording_hotkey_name = None
+                for button in self.hotkey_record_buttons.values():
+                    button.setText("设置")
+                if status_text is not None:
+                    self.status_value_label.setText(status_text)
+
+            def _hotkey_from_event(self, event) -> str | None:
+                modifiers = []
+                if event.modifiers() & QtCore.Qt.ControlModifier:
+                    modifiers.append("ctrl")
+                if event.modifiers() & QtCore.Qt.AltModifier:
+                    modifiers.append("alt")
+                if event.modifiers() & QtCore.Qt.ShiftModifier:
+                    modifiers.append("shift")
+                if not modifiers:
+                    return None
+
+                modifier_keys = {
+                    QtCore.Qt.Key_Control,
+                    QtCore.Qt.Key_Shift,
+                    QtCore.Qt.Key_Alt,
+                    QtCore.Qt.Key_Meta,
+                }
+                if event.key() in modifier_keys:
+                    return None
+
+                key_name = self._key_name_from_event(event)
+                if key_name is None:
+                    return None
+                return "+".join(modifiers + [key_name])
+
+            def _key_name_from_event(self, event) -> str | None:
+                text = event.text().strip().lower()
+                if len(text) == 1 and text.isprintable():
+                    return text
+                special_keys = {
+                    QtCore.Qt.Key_Space: "space",
+                    QtCore.Qt.Key_Tab: "tab",
+                    QtCore.Qt.Key_Return: "enter",
+                    QtCore.Qt.Key_Enter: "enter",
+                    QtCore.Qt.Key_Delete: "delete",
+                    QtCore.Qt.Key_Backspace: "backspace",
+                    QtCore.Qt.Key_Left: "left",
+                    QtCore.Qt.Key_Right: "right",
+                    QtCore.Qt.Key_Up: "up",
+                    QtCore.Qt.Key_Down: "down",
+                }
+                if event.key() in special_keys:
+                    return special_keys[event.key()]
+                if QtCore.Qt.Key_F1 <= event.key() <= QtCore.Qt.Key_F12:
+                    return f"f{event.key() - QtCore.Qt.Key_F1 + 1}"
+                return None
+
+            def _format_hotkey_display(self, hotkey: str) -> str:
+                display_parts = []
+                for part in hotkey.split("+"):
+                    if len(part) == 1:
+                        display_parts.append(part.upper())
+                    else:
+                        display_parts.append(part.capitalize())
+                return "+".join(display_parts)
+
+            def _refresh_hotkey_labels(self) -> None:
+                for action, label in self.hotkey_value_labels.items():
+                    label.setText(self._format_hotkey_display(controller.session.hotkeys[action]))
+
+            def _register_hotkeys(self) -> None:
+                self._hotkeys_manager.register(
                     {
-                        controller.session.hotkeys["calibrate"]: self._select_region,
-                        controller.session.hotkeys["start"]: self._start,
-                        controller.session.hotkeys["stop"]: controller.cancel,
+                        controller.session.hotkeys["calibrate"]: lambda: self._queue_hotkey_action("calibrate"),
+                        controller.session.hotkeys["start"]: lambda: self._queue_hotkey_action("start"),
+                        controller.session.hotkeys["stop"]: lambda: self._queue_hotkey_action("stop"),
                     }
                 )
 
+            def _queue_hotkey_action(self, action: str) -> None:
+                self.hotkey_action_requested.emit(action)
+
+            def _handle_hotkey_action(self, action: str) -> None:
+                if action == "calibrate":
+                    self._preview()
+                    return
+                if action == "start":
+                    self._start()
+                    return
+                if action == "stop":
+                    controller.cancel()
+
+            def _hotkey_update_status(self, action: str, hotkey: str) -> str:
+                status = f"已更新{self._hotkey_titles[action]}热键"
+                hotkey_parts = set(hotkey.split("+"))
+                if {"alt", "shift"}.issubset(hotkey_parts):
+                    status += "；注意 Alt+Shift 可能与系统输入法或键盘布局切换冲突"
+                return status
+
+            def _save_runtime_settings(self) -> None:
+                self._settings_store.save(UserSettings.from_session(controller.session))
+
+            def _on_draw_mouse_button_changed(self, _index=None) -> None:
+                controller.session.draw_mouse_button = self.mouse_button_combo.currentData()
+                self._save_runtime_settings()
+
+            def _fill_local_proxy(self) -> None:
+                self.proxy_input.setText("http://127.0.0.1:7890")
+
             def _browse_image(self) -> None:
                 image_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    self, "Select image", "", "Images (*.png *.jpg *.jpeg *.webp)"
+                    self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.webp)"
                 )
                 if image_path:
-                    controller.load_image(image_path)
-                    self.image_label.setText(Path(image_path).name)
-                    self.status_label.setText("Image loaded")
+                    self._load_image_from_path(image_path)
+
+            def _paste_image_from_clipboard(self) -> None:
+                if not self._try_import_image_from_clipboard():
+                    self.status_value_label.setText("剪贴板中没有可用图片")
+
+            def _try_import_image_from_clipboard(self) -> bool:
+                image_path = self._clipboard_to_temp_image()
+                if not image_path:
+                    return False
+                self._load_image_from_path(image_path, from_clipboard=True)
+                return True
+
+            def _clipboard_to_temp_image(self) -> str | None:
+                clipboard = QtWidgets.QApplication.clipboard()
+                mime_data = clipboard.mimeData()
+
+                if mime_data is not None and mime_data.hasUrls():
+                    for url in mime_data.urls():
+                        local_path = self._local_image_path_from_url(url)
+                        if local_path is not None:
+                            return local_path
+
+                text = clipboard.text().strip()
+                if text:
+                    local_path = self._local_image_path_from_text(text)
+                    if local_path is not None:
+                        return local_path
+
+                image = clipboard.image()
+                if image.isNull():
+                    return None
+
+                temp_dir = Path(tempfile.gettempdir()) / "sts_draw_clipboard"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                image_path = temp_dir / f"clipboard_{uuid.uuid4().hex}.png"
+                if not image.save(str(image_path), "PNG"):
+                    return None
+                return str(image_path)
+
+            def _local_image_path_from_url(self, url) -> str | None:
+                if not url.isLocalFile():
+                    return None
+                return self._validated_image_path(url.toLocalFile())
+
+            def _local_image_path_from_text(self, text: str) -> str | None:
+                url = QtCore.QUrl(text)
+                if url.isValid() and url.isLocalFile():
+                    return self._validated_image_path(url.toLocalFile())
+                return self._validated_image_path(text)
+
+            def _validated_image_path(self, candidate: str) -> str | None:
+                path = Path(candidate)
+                if not path.exists() or not path.is_file():
+                    return None
+                if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                    return None
+                return str(path)
+
+            def _load_image_from_path(self, image_path: str, from_clipboard: bool = False) -> None:
+                controller.load_image(image_path)
+                controller.session.line_art = None
+                controller.session.active_region = None
+                controller.session.stroke_plan = None
+                controller.session.last_preview = None
+                controller.session.preview_scale = None
+                self.image_name_value_label.setText(Path(image_path).name)
+                self._set_original_preview(image_path)
+                self._clear_line_art_preview()
+                self.preview_value_label.setText("未生成")
+                self.region_value_label.setText("未选择")
+                self.status_value_label.setText("已从剪贴板导入图片" if from_clipboard else "已载入图片")
 
             def _generate_line_art(self) -> None:
-                controller.gemini_client.settings.api_key = self.api_key_input.text().strip()
+                controller.image_generation_client.settings.api_key = self.api_key_input.text().strip()
+                controller.image_generation_client.settings.model = self.model_input.text().strip()
+                controller.image_generation_client.settings.base_url = self.base_url_input.text().strip()
+                controller.image_generation_client.settings.proxy_url = self.proxy_input.text().strip() or None
                 try:
                     controller.generate_line_art()
                 except Exception as exc:  # pragma: no cover
-                    self.status_label.setText(str(exc))
+                    self.status_value_label.setText(self._format_error(exc))
                     return
-                self.status_label.setText("Line art ready")
 
-            def _select_region(self) -> None:
-                try:
-                    region = calibrator.select_region()
-                except Exception as exc:  # pragma: no cover
-                    self.status_label.setText(str(exc))
-                    return
-                controller.set_region(region)
-                self.status_label.setText(f"Region: {region.bounds}")
+                if controller.session.line_art is not None:
+                    self._set_line_art_preview(controller.session.line_art)
+                controller.session.active_region = None
+                controller.session.stroke_plan = None
+                controller.session.last_preview = None
+                self.status_value_label.setText("线稿已生成")
+                self.region_value_label.setText("未选择")
+                self.preview_value_label.setText("待生成")
 
             def _preview(self) -> None:
+                if controller.session.line_art is None:
+                    self.status_value_label.setText("请先生成线稿")
+                    return
+
+                try:
+                    placement = calibrator.place_preview(
+                        controller.session.line_art,
+                        initial_scale=controller.session.preview_scale or 1.0,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    self.status_value_label.setText(self._format_error(exc))
+                    return
+
+                controller.set_region(placement.region)
+                controller.session.preview_scale = placement.scale
+                self.region_value_label.setText(f"{placement.region.width} × {placement.region.height}")
+
                 try:
                     preview = controller.prepare_preview()
                 except Exception as exc:  # pragma: no cover
-                    self.status_label.setText(str(exc))
+                    self.status_value_label.setText(self._format_error(exc))
                     return
-                self.status_label.setText(f"Preview ready: {preview.segment_count} segments")
+                segment_count = getattr(preview, "segment_count", None)
+                if segment_count is None and isinstance(preview, dict):
+                    segment_count = preview.get("segment_count")
+                self.status_value_label.setText("预览定位已确认")
+                self.preview_value_label.setText(f"{segment_count or 0} 段路径")
 
             def _start(self) -> None:
                 try:
                     controller.start_drawing()
                 except Exception as exc:  # pragma: no cover
-                    self.status_label.setText(str(exc))
+                    self.status_value_label.setText(self._format_error(exc))
                     return
-                self.status_label.setText(controller.session.status)
+                self.status_value_label.setText("正在绘制")
 
             def closeEvent(self, event) -> None:
-                self.hide()
-                event.ignore()
+                event.accept()
+
+            def _create_card(self, object_name: str, title: str, subtitle: str):
+                card = QtWidgets.QFrame()
+                card.setObjectName(object_name)
+                card_layout = QtWidgets.QVBoxLayout(card)
+                card_layout.setContentsMargins(16, 16, 16, 16)
+                card_layout.setSpacing(10)
+
+                title_label = QtWidgets.QLabel(title)
+                title_label.setObjectName("card_title")
+                subtitle_label = QtWidgets.QLabel(subtitle)
+                subtitle_label.setObjectName("card_subtitle")
+                subtitle_label.setWordWrap(True)
+
+                card_layout.addWidget(title_label)
+                card_layout.addWidget(subtitle_label)
+                return card
+
+            def _create_preview_card(self, title: str, preview_object_name: str, empty_text: str, clickable: bool = False):
+                card = QtWidgets.QFrame()
+                card.setObjectName("preview_card")
+                card_layout = QtWidgets.QVBoxLayout(card)
+                card_layout.setContentsMargins(14, 14, 14, 14)
+                card_layout.setSpacing(10)
+
+                title_label = QtWidgets.QLabel(title)
+                title_label.setObjectName("preview_title")
+                preview_label = ClickablePreviewLabel() if clickable else QtWidgets.QLabel()
+                preview_label.setObjectName(preview_object_name)
+                preview_label.setAlignment(QtCore.Qt.AlignCenter)
+                preview_label.setWordWrap(True)
+                preview_label.setMinimumHeight(280)
+                preview_label.setText(empty_text)
+
+                card_layout.addWidget(title_label)
+                card_layout.addWidget(preview_label, 1)
+                return card, preview_label
+
+            def _set_original_preview(self, image_path: str) -> None:
+                pixmap = QtGui.QPixmap(image_path)
+                if pixmap.isNull():
+                    self.original_preview_label.setText("无法预览原图")
+                    self._original_pixmap = None
+                    return
+                self._original_pixmap = pixmap
+                self._update_preview_label(self.original_preview_label, pixmap)
+
+            def _set_line_art_preview(self, line_art) -> None:
+                pixmap = QtGui.QPixmap()
+                pixmap.loadFromData(line_art.image_bytes)
+                if pixmap.isNull():
+                    self.line_art_preview_label.setText("无法预览线稿")
+                    self._line_art_pixmap = None
+                    return
+                self._line_art_pixmap = pixmap
+                self._update_preview_label(self.line_art_preview_label, pixmap)
+
+            def _clear_line_art_preview(self) -> None:
+                self._line_art_pixmap = None
+                self.line_art_preview_label.clear()
+                self.line_art_preview_label.setText("生成线稿后会显示在这里")
+
+            def _refresh_preview_pixmaps(self) -> None:
+                if self._original_pixmap is not None:
+                    self._update_preview_label(self.original_preview_label, self._original_pixmap)
+                if self._line_art_pixmap is not None:
+                    self._update_preview_label(self.line_art_preview_label, self._line_art_pixmap)
+
+            def _update_preview_label(self, label, pixmap) -> None:
+                scaled = pixmap.scaled(label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                label.setPixmap(scaled)
+
+            def _format_error(self, exc: Exception) -> str:
+                text = str(exc)
+                mapping = {
+                    "No image has been selected.": "请先选择图片",
+                    "Line art is not ready.": "请先生成线稿",
+                    "Calibration region is required.": "请先选择绘制区域",
+                    "Preview must be prepared first.": "请先生成预览",
+                    "Preview placement was cancelled.": "已取消定位预览",
+                }
+                return mapping.get(text, f"操作失败：{text}")
+
+            def _apply_styles(self) -> None:
+                self.setStyleSheet(
+                    """
+                    QMainWindow { background: #f5f1ea; }
+                    QFrame#preview_panel, QFrame#control_panel, QFrame#config_panel,
+                    QFrame#actions_panel, QFrame#status_panel, QFrame#preview_card {
+                        background: #fffdf9;
+                        border: 1px solid #e6dfd4;
+                        border-radius: 18px;
+                    }
+                    QLabel { color: #3f342b; font-size: 14px; }
+                    QLabel#card_title {
+                        font-size: 20px;
+                        font-weight: 700;
+                        color: #2f251e;
+                    }
+                    QLabel#card_subtitle, QLabel#hint_label {
+                        color: #7a6a5f;
+                    }
+                    QLabel#preview_title {
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: #6b594d;
+                    }
+                    QLabel#image_name_value {
+                        min-height: 38px;
+                        padding: 8px 12px;
+                        background: #f6efe5;
+                        border: 1px solid #e5d9c9;
+                        border-radius: 12px;
+                    }
+                    QLabel#hotkey_value {
+                        min-height: 38px;
+                        padding: 8px 12px;
+                        background: #f6efe5;
+                        border: 1px solid #e5d9c9;
+                        border-radius: 12px;
+                    }
+                    QLabel#original_preview, QLabel#line_art_preview {
+                        background: #faf6f0;
+                        border: 1px dashed #d8c9b7;
+                        border-radius: 14px;
+                        color: #8a796d;
+                        padding: 12px;
+                    }
+                    QLabel#original_preview:hover {
+                        border-color: #d98652;
+                        background: #fcf2e6;
+                    }
+                    QLineEdit {
+                        min-height: 38px;
+                        padding: 0 12px;
+                        background: #fffaf4;
+                        border: 1px solid #dccfbe;
+                        border-radius: 12px;
+                        selection-background-color: #df9362;
+                    }
+                    QComboBox {
+                        min-height: 38px;
+                        padding: 0 12px;
+                        background: #fffaf4;
+                        border: 1px solid #dccfbe;
+                        border-radius: 12px;
+                    }
+                    QPushButton {
+                        min-height: 40px;
+                        border-radius: 12px;
+                        border: 1px solid #d6c8b7;
+                        background: #fff9f2;
+                        color: #41362d;
+                        font-weight: 600;
+                        padding: 0 14px;
+                    }
+                    QPushButton#compact_button {
+                        min-height: 38px;
+                        padding: 0 12px;
+                    }
+                    QPushButton:hover { background: #fbf0e3; }
+                    QPushButton#primary_button {
+                        background: #d98652;
+                        color: white;
+                        border: none;
+                    }
+                    QPushButton#primary_button:hover { background: #c97744; }
+                    """
+                )
 
         return MainWindow()
 
 
 def build_default_window():
     from sts_draw.draw_executor import DrawExecutor
-    from sts_draw.gemini_client import GeminiClient
+    from sts_draw.image_generation_client import OpenAICompatibleClient
     from sts_draw.preview_renderer import PreviewRenderer
     from sts_draw.stroke_planner import StrokePlanner
 
     controller = AppController(
-        gemini_client=GeminiClient(),
+        gemini_client=OpenAICompatibleClient(),
         stroke_planner=StrokePlanner(),
         preview_renderer=PreviewRenderer(),
         draw_executor=DrawExecutor(),
     )
     calibrator = CanvasCalibrator()
     hotkeys = GlobalHotkeyManager()
-    return MainWindowFactory().create(controller, calibrator, hotkeys)
+    settings_store = UserSettingsStore()
+    return MainWindowFactory().create(controller, calibrator, hotkeys, settings_store=settings_store)

@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import dist
 
+DEFAULT_HOTKEYS = {
+    "calibrate": "ctrl+alt+c",
+    "start": "ctrl+alt+d",
+    "stop": "ctrl+alt+s",
+}
+DEFAULT_DRAW_MOUSE_BUTTON = "left"
+
 
 @dataclass(slots=True)
 class LineArtResult:
@@ -37,6 +44,12 @@ class CalibrationRegion:
 
 
 @dataclass(slots=True)
+class PreviewPlacementResult:
+    region: CalibrationRegion
+    scale: float
+
+
+@dataclass(slots=True)
 class StrokeSegment:
     start: tuple[int, int]
     end: tuple[int, int]
@@ -67,13 +80,9 @@ class ExecutionSession:
     stroke_plan: StrokePlan | None = None
     line_art: LineArtResult | None = None
     image_path: str | None = None
-    hotkeys: dict[str, str] = field(
-        default_factory=lambda: {
-            "calibrate": "ctrl+alt+c",
-            "start": "ctrl+alt+d",
-            "stop": "ctrl+alt+s",
-        }
-    )
+    hotkeys: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_HOTKEYS))
+    draw_mouse_button: str = DEFAULT_DRAW_MOUSE_BUTTON
+    preview_scale: float | None = None
 
     def cancel(self, reason: str) -> None:
         self.status = "cancelled"

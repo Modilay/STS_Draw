@@ -28,6 +28,16 @@ class ExecutionSessionTests(unittest.TestCase):
         self.assertEqual(session.status, "cancelled")
         self.assertEqual(session.error_reason, "hotkey")
 
+    def test_defaults_to_left_mouse_button(self) -> None:
+        session = ExecutionSession()
+
+        self.assertEqual(session.draw_mouse_button, "left")
+
+    def test_defaults_preview_scale_to_none(self) -> None:
+        session = ExecutionSession()
+
+        self.assertIsNone(session.preview_scale)
+
 
 class LineArtResultTests(unittest.TestCase):
     def test_reports_dimensions_from_bytes(self) -> None:

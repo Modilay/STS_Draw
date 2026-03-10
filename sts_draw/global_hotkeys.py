@@ -13,6 +13,9 @@ class GlobalHotkeyManager:
         except ImportError as exc:
             raise RuntimeError("keyboard is not installed.") from exc
 
+        if self._registered:
+            keyboard.unhook_all_hotkeys()
+            self._registered = False
         for hotkey, callback in bindings.items():
             keyboard.add_hotkey(hotkey, callback)
         self._registered = True
