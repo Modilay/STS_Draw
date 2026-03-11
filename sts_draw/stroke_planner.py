@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import dist
+from math import acos, degrees, dist
 
-from sts_draw.models import CalibrationRegion, StrokePlan, StrokeSegment
+from sts_draw.models import BezierStroke, CalibrationRegion, LineStroke, MoveStroke, Stroke, StrokePlan
 
 
 Point = tuple[int, int]
@@ -15,6 +15,13 @@ class PlannerSettings:
     min_component_pixels: int = 3
     min_path_pixels: int = 2
     simplify_tolerance: float = 0.75
+    line_fit_tolerance: float = 0.9
+    curve_fit_tolerance: float = 15.0
+    min_curve_points: int = 4
+    max_line_length_ratio: float = 1.05
+    max_curve_length_ratio: float = 1.15
+    max_curve_turn_degrees: float = 60.0
+    closed_span_ratio_threshold: float = 0.45
 
 
 class StrokePlanner:
@@ -33,17 +40,12 @@ class StrokePlanner:
         cleaned = _remove_small_components(matrix, self.settings.min_component_pixels)
         skeleton = _zhang_suen_thinning(cleaned)
         paths = _trace_skeleton_paths(skeleton)
-        simplified_paths = [
-            _simplify_path(path, self.settings.simplify_tolerance)
-            for path in paths
-            if len(path) >= self.settings.min_path_pixels
-        ]
-        simplified_paths = [path for path in simplified_paths if len(path) >= 2]
-        ordered_paths = _order_paths(simplified_paths)
+        filtered_paths = [path for path in paths if len(path) >= self.settings.min_path_pixels]
+        ordered_paths = _order_paths(filtered_paths)
 
         x_step = region.width / cols
         y_step = region.height / rows
-        segments: list[StrokeSegment] = []
+        segments: list[Stroke] = []
 
         for path in ordered_paths:
             screen_points = [
@@ -55,27 +57,83 @@ class StrokePlanner:
                 continue
 
             start = screen_points[0]
-            segments.append(
-                StrokeSegment(
-                    start=start,
-                    end=start,
-                    pen_down=False,
+            segments.append(MoveStroke(point=start))
+            segments.extend(self._fit_strokes(screen_points))
+
+        return StrokePlan(segments=segments, source_size=(cols, rows), region=region)
+
+    def _fit_strokes(self, points: list[Point]) -> list[Stroke]:
+        if len(points) < 2:
+            return []
+        strokes = self._fit_stroke_range(points)
+        first_draw_seen = False
+        for stroke in strokes:
+            if isinstance(stroke, (LineStroke, BezierStroke)):
+                stroke.continues_path = first_draw_seen
+                first_draw_seen = True
+        return strokes
+
+    def _fit_stroke_range(self, points: list[Point]) -> list[Stroke]:
+        points = _dedupe_consecutive_points(points)
+        if len(points) < 2:
+            return []
+        if len(points) == 2:
+            return [LineStroke(start=points[0], end=points[1], speed_pixels_per_second=self.settings.speed_pixels_per_second)]
+
+        line_error = _max_line_error(points)
+        line_length_ratio = _line_length_ratio(points)
+        if (
+            line_error <= self.settings.line_fit_tolerance
+            and line_length_ratio <= self.settings.max_line_length_ratio
+        ):
+            return [LineStroke(start=points[0], end=points[-1], speed_pixels_per_second=self.settings.speed_pixels_per_second)]
+
+        if len(points) >= self.settings.min_curve_points:
+            analysis_points = _simplify_path(points, self.settings.simplify_tolerance)
+            if (
+                not _is_near_closed_span(points, self.settings.closed_span_ratio_threshold)
+                and not _has_disallowed_curve_turns(analysis_points, self.settings.max_curve_turn_degrees)
+            ):
+                bezier = _fit_bezier(points, self.settings.speed_pixels_per_second)
+                bezier_error = _max_bezier_error(points, bezier)
+                bezier_length_ratio = _bezier_length_ratio(points, bezier)
+                if (
+                    bezier_error <= self.settings.curve_fit_tolerance
+                    and bezier_error < line_error * 0.85
+                    and bezier_length_ratio <= self.settings.max_curve_length_ratio
+                    and _bezier_within_expanded_bounds(points, bezier, self.settings.curve_fit_tolerance)
+                ):
+                    return [bezier]
+
+        split_index = _best_split_index(points)
+        if split_index <= 0 or split_index >= len(points) - 1:
+            return self._fallback_line_strokes(points)
+
+        left = self._fit_stroke_range(points[: split_index + 1])
+        right = self._fit_stroke_range(points[split_index:])
+        if not left or not right:
+            return self._fallback_line_strokes(points)
+        return left + right
+
+    def _fallback_line_strokes(self, points: list[Point]) -> list[Stroke]:
+        tolerance = max(self.settings.simplify_tolerance / 2, 0.25)
+        simplified = _simplify_path(points, tolerance)
+        simplified = _dedupe_consecutive_points(simplified)
+        if len(simplified) <= 2 and len(points) > 2 and _line_length_ratio(points) > self.settings.max_line_length_ratio:
+            simplified = points
+
+        strokes: list[Stroke] = []
+        for point_a, point_b in zip(simplified, simplified[1:]):
+            if point_a == point_b:
+                continue
+            strokes.append(
+                LineStroke(
+                    start=point_a,
+                    end=point_b,
                     speed_pixels_per_second=self.settings.speed_pixels_per_second,
                 )
             )
-            for point_a, point_b in zip(screen_points, screen_points[1:]):
-                if point_a == point_b:
-                    continue
-                segments.append(
-                    StrokeSegment(
-                        start=point_a,
-                        end=point_b,
-                        pen_down=True,
-                        speed_pixels_per_second=self.settings.speed_pixels_per_second,
-                    )
-                )
-
-        return StrokePlan(segments=segments, source_size=(cols, rows), region=region)
+        return strokes
 
     @staticmethod
     def _to_screen_point(
@@ -337,6 +395,168 @@ def _simplify_path(path: list[Point], tolerance: float) -> list[Point]:
     return _dedupe_consecutive_points(simplified)
 
 
+def _fit_bezier(points: list[Point], speed_pixels_per_second: int) -> BezierStroke:
+    start = points[0]
+    end = points[-1]
+    chord_length = dist(start, end)
+    start_tangent = _estimate_tangent(points, from_start=True)
+    end_tangent = _estimate_tangent(points, from_start=False)
+    start_handle = max(min(_polyline_length(points[: min(len(points), 4)]), max(chord_length, 1.0)), 1.0) / 3
+    end_handle = max(min(_polyline_length(points[-min(len(points), 4):]), max(chord_length, 1.0)), 1.0) / 3
+    control1 = (
+        round(start[0] + start_tangent[0] * start_handle),
+        round(start[1] + start_tangent[1] * start_handle),
+    )
+    control2 = (
+        round(end[0] - end_tangent[0] * end_handle),
+        round(end[1] - end_tangent[1] * end_handle),
+    )
+    return BezierStroke(
+        start=start,
+        control1=control1,
+        control2=control2,
+        end=end,
+        speed_pixels_per_second=speed_pixels_per_second,
+    )
+
+
+def _max_line_error(points: list[Point]) -> float:
+    return max((_distance_to_segment(point, points[0], points[-1]) for point in points[1:-1]), default=0.0)
+
+
+def _max_bezier_error(points: list[Point], bezier: BezierStroke) -> float:
+    if len(points) <= 2:
+        return 0.0
+    sampled = _sampled_bezier_polyline(bezier, max(len(points) * 4, 16))
+    max_error = 0.0
+    for point in points[1:-1]:
+        max_error = max(max_error, _distance_to_polyline(point, sampled))
+    return max_error
+
+
+def _bezier_length_ratio(points: list[Point], bezier: BezierStroke) -> float:
+    source_length = _polyline_length(points)
+    if source_length <= 0:
+        return 1.0
+    return _polyline_length(_sampled_bezier_polyline(bezier, max(len(points) * 4, 16))) / source_length
+
+
+def _bezier_within_expanded_bounds(points: list[Point], bezier: BezierStroke, padding: float) -> bool:
+    sampled = _sampled_bezier_polyline(bezier, max(len(points) * 4, 16))
+    min_x = min(point[0] for point in points) - padding
+    max_x = max(point[0] for point in points) + padding
+    min_y = min(point[1] for point in points) - padding
+    max_y = max(point[1] for point in points) + padding
+    return all(min_x <= point[0] <= max_x and min_y <= point[1] <= max_y for point in sampled)
+
+
+def _sampled_bezier_polyline(bezier: BezierStroke, steps: int) -> list[Point]:
+    return [bezier.start] + bezier.sample_points(steps=steps)
+
+
+def _estimate_tangent(points: list[Point], from_start: bool) -> tuple[float, float]:
+    if len(points) < 2:
+        return (1.0, 0.0)
+    origin = points[0] if from_start else points[-1]
+    offsets = points[1 : min(len(points), 4)] if from_start else list(reversed(points[max(len(points) - 4, 0) : -1]))
+    sum_x = 0.0
+    sum_y = 0.0
+    for point in offsets:
+        if from_start:
+            sum_x += point[0] - origin[0]
+            sum_y += point[1] - origin[1]
+        else:
+            sum_x += origin[0] - point[0]
+            sum_y += origin[1] - point[1]
+    if sum_x == 0 and sum_y == 0:
+        fallback = (
+            points[-1][0] - points[0][0],
+            points[-1][1] - points[0][1],
+        )
+        return _normalize_vector(fallback)
+    return _normalize_vector((sum_x, sum_y))
+
+
+def _normalize_vector(vector: tuple[float, float]) -> tuple[float, float]:
+    length = dist((0.0, 0.0), vector)
+    if length <= 0:
+        return (1.0, 0.0)
+    return (vector[0] / length, vector[1] / length)
+
+
+def _line_length_ratio(points: list[Point]) -> float:
+    chord_length = dist(points[0], points[-1])
+    if chord_length <= 0:
+        return float("inf")
+    return _polyline_length(points) / chord_length
+
+
+def _polyline_length(points: list[Point]) -> float:
+    return sum(dist(point_a, point_b) for point_a, point_b in zip(points, points[1:]))
+
+
+def _is_near_closed_span(points: list[Point], threshold: float) -> bool:
+    polyline_length = _polyline_length(points)
+    if polyline_length <= 0:
+        return False
+    return (dist(points[0], points[-1]) / polyline_length) < threshold
+
+
+def _has_disallowed_curve_turns(points: list[Point], max_turn_degrees: float) -> bool:
+    if len(points) < 3:
+        return False
+
+    last_turn_sign = 0
+    for index in range(1, len(points) - 1):
+        turn_degrees = _turn_magnitude_degrees(points[index - 1], points[index], points[index + 1])
+        if turn_degrees > max_turn_degrees:
+            return True
+
+        sign = _turn_sign(points[index - 1], points[index], points[index + 1])
+        if sign == 0 or turn_degrees < 10.0:
+            continue
+        if last_turn_sign != 0 and sign != last_turn_sign:
+            return True
+        last_turn_sign = sign
+    return False
+
+
+def _turn_sign(previous: Point, current: Point, next_point: Point) -> int:
+    vector_a = (current[0] - previous[0], current[1] - previous[1])
+    vector_b = (next_point[0] - current[0], next_point[1] - current[1])
+    cross = (vector_a[0] * vector_b[1]) - (vector_a[1] * vector_b[0])
+    if abs(cross) < 1e-6:
+        return 0
+    return 1 if cross > 0 else -1
+
+
+def _best_split_index(points: list[Point]) -> int:
+    best_index = len(points) // 2
+    largest_turn = -1.0
+    for index in range(1, len(points) - 1):
+        turn = _turn_magnitude_degrees(points[index - 1], points[index], points[index + 1])
+        if turn > largest_turn:
+            largest_turn = turn
+            best_index = index
+    return best_index
+
+
+def _turn_angle(previous: Point, current: Point, next_point: Point) -> float:
+    vector_a = (previous[0] - current[0], previous[1] - current[1])
+    vector_b = (next_point[0] - current[0], next_point[1] - current[1])
+    length_a = dist((0.0, 0.0), vector_a)
+    length_b = dist((0.0, 0.0), vector_b)
+    if length_a == 0 or length_b == 0:
+        return 0.0
+    cosine = ((vector_a[0] * vector_b[0]) + (vector_a[1] * vector_b[1])) / (length_a * length_b)
+    cosine = max(-1.0, min(1.0, cosine))
+    return acos(cosine)
+
+
+def _turn_magnitude_degrees(previous: Point, current: Point, next_point: Point) -> float:
+    return max(0.0, 180.0 - degrees(_turn_angle(previous, current, next_point)))
+
+
 def _rdp(path: list[Point], tolerance: float) -> list[Point]:
     if len(path) <= 2:
         return path[:]
@@ -373,6 +593,14 @@ def _distance_to_segment(point: Point, start: Point, end: Point) -> float:
     projection = max(0.0, min(1.0, projection))
     projected = (start_x + projection * dx, start_y + projection * dy)
     return dist(point, projected)
+
+
+def _distance_to_polyline(point: Point, polyline: list[Point]) -> float:
+    if not polyline:
+        return 0.0
+    if len(polyline) == 1:
+        return dist(point, polyline[0])
+    return min(_distance_to_segment(point, point_a, point_b) for point_a, point_b in zip(polyline, polyline[1:]))
 
 
 def _dedupe_consecutive_points(points: list[Point]) -> list[Point]:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sts_draw.app_controller import AppController
 from sts_draw.canvas_calibrator import CanvasCalibrator
+from sts_draw.draw_executor import executor_settings_for_profile
 from sts_draw.global_hotkeys import GlobalHotkeyManager, HotkeyCheckResult
 from sts_draw.models import HotkeyStatus
 from sts_draw.user_settings import UserSettings, UserSettingsStore
@@ -29,6 +30,8 @@ class MainWindowFactory:
         saved_settings = settings_store.load()
         controller.session.hotkeys.update(saved_settings.hotkeys)
         controller.session.draw_mouse_button = saved_settings.draw_mouse_button
+        controller.session.draw_speed_profile = saved_settings.draw_speed_profile
+        controller.draw_executor.settings = executor_settings_for_profile(saved_settings.draw_speed_profile)
         controller.image_generation_client.settings.api_key = saved_settings.api_key
         controller.image_generation_client.settings.proxy_url = saved_settings.proxy_url
         controller.image_generation_client.settings.model = saved_settings.model
@@ -42,6 +45,84 @@ class MainWindowFactory:
                     self.clicked.emit()
                 super().mousePressEvent(event)
 
+        class SpinnerWidget(QtWidgets.QWidget):
+            def __init__(self, parent=None) -> None:
+                super().__init__(parent)
+                self._angle = 0
+                self._timer = QtCore.QTimer(self)
+                self._timer.timeout.connect(self._tick)
+                self.setFixedSize(64, 64)
+
+            def start(self) -> None:
+                if not self._timer.isActive():
+                    self._timer.start(24)
+
+            def stop(self) -> None:
+                if self._timer.isActive():
+                    self._timer.stop()
+                self._angle = 0
+                self.update()
+
+            def is_spinning(self) -> bool:
+                return self._timer.isActive()
+
+            def _tick(self) -> None:
+                self._angle = (self._angle + 30) % 360
+                self.update()
+
+            def paintEvent(self, _event) -> None:
+                painter = QtGui.QPainter(self)
+                painter.setRenderHint(QtGui.QPainter.Antialiasing)
+                painter.translate(self.width() / 2, self.height() / 2)
+                painter.rotate(self._angle)
+
+                dot_count = 12
+                radius = 22
+                dot_radius = 4
+                base_color = QtGui.QColor("#fff5ea")
+                for index in range(dot_count):
+                    alpha = round(255 * ((index + 1) / dot_count))
+                    color = QtGui.QColor(base_color)
+                    color.setAlpha(alpha)
+                    painter.setBrush(color)
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.drawEllipse(QtCore.QPointF(0, -radius), dot_radius, dot_radius)
+                    painter.rotate(360 / dot_count)
+
+        class BusyOverlay(QtWidgets.QWidget):
+            def __init__(self, parent=None) -> None:
+                super().__init__(parent)
+                self.setObjectName("busy_overlay")
+                self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+                layout = QtWidgets.QVBoxLayout(self)
+                layout.setContentsMargins(24, 24, 24, 24)
+                layout.addStretch(1)
+                self.panel = QtWidgets.QFrame()
+                self.panel.setObjectName("busy_overlay_panel")
+                panel_layout = QtWidgets.QVBoxLayout(self.panel)
+                panel_layout.setContentsMargins(28, 24, 28, 24)
+                panel_layout.setSpacing(12)
+                panel_layout.setAlignment(QtCore.Qt.AlignCenter)
+                self.spinner = SpinnerWidget(self.panel)
+                self.message_label = QtWidgets.QLabel("")
+                self.message_label.setObjectName("busy_overlay_message")
+                self.message_label.setAlignment(QtCore.Qt.AlignCenter)
+                panel_layout.addWidget(self.spinner, 0, QtCore.Qt.AlignCenter)
+                panel_layout.addWidget(self.message_label, 0, QtCore.Qt.AlignCenter)
+                layout.addWidget(self.panel, 0, QtCore.Qt.AlignCenter)
+                layout.addStretch(1)
+                self.hide()
+
+            def show_message(self, message: str) -> None:
+                self.message_label.setText(message)
+                self.spinner.start()
+                self.show()
+                self.raise_()
+
+            def hide_overlay(self) -> None:
+                self.spinner.stop()
+                self.hide()
+
         class MainWindow(QtWidgets.QMainWindow):
             hotkey_action_requested = QtCore.Signal(str)
             execution_status_changed = QtCore.Signal(str)
@@ -49,11 +130,14 @@ class MainWindowFactory:
             line_art_generation_busy = QtCore.Signal(bool)
             line_art_generation_succeeded = QtCore.Signal(object)
             line_art_generation_failed = QtCore.Signal(str)
+            preview_preparation_busy = QtCore.Signal(bool)
+            preview_preparation_succeeded = QtCore.Signal(object)
+            preview_preparation_failed = QtCore.Signal(str)
 
             def __init__(self) -> None:
                 super().__init__()
                 self.setWindowTitle("STS 绘图助手")
-                self.resize(1120, 760)
+                self.resize(1120, 700)
                 self._controller = controller
                 self._hotkeys_manager = hotkeys
                 self._settings_store = settings_store
@@ -62,17 +146,24 @@ class MainWindowFactory:
                 self._recording_hotkey_name: str | None = None
                 self._draw_thread: threading.Thread | None = None
                 self._line_art_thread: threading.Thread | None = None
+                self._preview_thread: threading.Thread | None = None
+                self._preview_restore_state: dict[str, object] | None = None
+                self._line_art_busy = False
+                self._preview_busy = False
+                self._has_centered_on_first_show = False
                 self._hotkey_titles = {
                     "calibrate": "定位预览",
                     "start": "开始绘制",
                     "stop": "停止绘制",
                 }
 
+                self._hotkey_titles["pause"] = "暂停/继续"
+
                 central = QtWidgets.QWidget()
                 self.root_layout = QtWidgets.QVBoxLayout(central)
                 self.root_layout.setObjectName("root_layout")
-                self.root_layout.setContentsMargins(24, 24, 24, 24)
-                self.root_layout.setSpacing(20)
+                self.root_layout.setContentsMargins(18, 18, 18, 18)
+                self.root_layout.setSpacing(14)
 
                 self._apply_styles()
                 self.hotkey_action_requested.connect(self._handle_hotkey_action)
@@ -81,6 +172,9 @@ class MainWindowFactory:
                 self.line_art_generation_busy.connect(self._on_line_art_generation_busy)
                 self.line_art_generation_succeeded.connect(self._on_line_art_generation_succeeded)
                 self.line_art_generation_failed.connect(self._on_line_art_generation_failed)
+                self.preview_preparation_busy.connect(self._on_preview_preparation_busy)
+                self.preview_preparation_succeeded.connect(self._on_preview_preparation_succeeded)
+                self.preview_preparation_failed.connect(self._on_preview_preparation_failed)
 
                 self.preview_panel = self._create_card(
                     "preview_panel",
@@ -88,7 +182,7 @@ class MainWindowFactory:
                     "上方直接对比原图与线稿效果。",
                 )
                 preview_layout = QtWidgets.QHBoxLayout()
-                preview_layout.setSpacing(16)
+                preview_layout.setSpacing(14)
                 self.preview_panel.layout().addLayout(preview_layout)
 
                 original_card, self.original_preview_label = self._create_preview_card(
@@ -111,7 +205,7 @@ class MainWindowFactory:
                     "下方完成配置、生成、校准和绘制。",
                 )
                 control_layout = QtWidgets.QHBoxLayout()
-                control_layout.setSpacing(16)
+                control_layout.setSpacing(14)
                 self.control_panel.layout().addLayout(control_layout)
 
                 config_card = self._create_card(
@@ -145,6 +239,12 @@ class MainWindowFactory:
                 self.mouse_button_combo.setCurrentIndex(
                     0 if controller.session.draw_mouse_button == "left" else 1
                 )
+                self.speed_profile_combo = QtWidgets.QComboBox()
+                self.speed_profile_combo.addItem("稳定", "stable")
+                self.speed_profile_combo.addItem("均衡", "balanced")
+                self.speed_profile_combo.addItem("快速", "fast")
+                speed_profile_index = self.speed_profile_combo.findData(controller.session.draw_speed_profile)
+                self.speed_profile_combo.setCurrentIndex(max(speed_profile_index, 0))
                 self._paste_aware_inputs = (
                     self.api_key_input,
                     self.model_input,
@@ -180,9 +280,9 @@ class MainWindowFactory:
                 hotkey_form = QtWidgets.QFormLayout()
                 hotkey_form.setLabelAlignment(QtCore.Qt.AlignLeft)
                 hotkey_form.setFormAlignment(QtCore.Qt.AlignTop)
-                hotkey_form.setHorizontalSpacing(10)
-                hotkey_form.setVerticalSpacing(10)
-                for action in ("calibrate", "start", "stop"):
+                hotkey_form.setHorizontalSpacing(8)
+                hotkey_form.setVerticalSpacing(8)
+                for action in ("calibrate", "start", "pause", "stop"):
                     value_label = QtWidgets.QLabel()
                     value_label.setObjectName("hotkey_value")
                     status_label = QtWidgets.QLabel()
@@ -204,6 +304,7 @@ class MainWindowFactory:
                     self.hotkey_record_buttons[action] = button
                     self.hotkey_status_labels[action] = status_label
                 hotkey_form.addRow("绘画按键", self.mouse_button_combo)
+                hotkey_form.addRow("绘画速度", self.speed_profile_combo)
                 self.shortcut_card.layout().addLayout(hotkey_form)
                 self.shortcut_card.layout().addStretch(1)
 
@@ -213,15 +314,17 @@ class MainWindowFactory:
                     "生成线稿后定位预览，再开始绘制。",
                 )
                 actions_grid = QtWidgets.QGridLayout()
-                actions_grid.setHorizontalSpacing(10)
-                actions_grid.setVerticalSpacing(10)
+                actions_grid.setHorizontalSpacing(8)
+                actions_grid.setVerticalSpacing(8)
                 self.line_art_button = QtWidgets.QPushButton("生成线稿")
                 self.preview_button = QtWidgets.QPushButton("定位预览")
                 self.start_button = QtWidgets.QPushButton("开始绘制")
                 self.start_button.setObjectName("primary_button")
+                self.stop_button = QtWidgets.QPushButton("停止绘制")
                 actions_grid.addWidget(self.line_art_button, 0, 0)
                 actions_grid.addWidget(self.preview_button, 0, 1)
-                actions_grid.addWidget(self.start_button, 1, 0, 1, 2)
+                actions_grid.addWidget(self.start_button, 1, 0)
+                actions_grid.addWidget(self.stop_button, 1, 1)
                 actions_card.layout().addLayout(actions_grid)
                 hint_label = QtWidgets.QLabel(
                     "点击原图预览可选择图片，Ctrl+V 可直接粘贴；定位预览时滚轮缩放。"
@@ -260,17 +363,23 @@ class MainWindowFactory:
                 self.root_layout.addWidget(self.preview_panel, 7)
                 self.root_layout.addWidget(self.control_panel, 4)
                 self.setCentralWidget(central)
+                self.busy_overlay = BusyOverlay(central)
+                self.busy_spinner = self.busy_overlay.spinner
+                self.busy_message_label = self.busy_overlay.message_label
+                self._update_busy_overlay_geometry()
 
                 self.original_preview_label.clicked.connect(self._browse_image)
                 self.line_art_button.clicked.connect(self._generate_line_art)
                 self.preview_button.clicked.connect(self._preview)
                 self.start_button.clicked.connect(self._start)
+                self.stop_button.clicked.connect(self._request_stop)
                 self.fill_proxy_button.clicked.connect(self._fill_local_proxy)
                 self.api_key_input.textChanged.connect(self._on_runtime_text_changed)
                 self.model_input.textChanged.connect(self._on_runtime_text_changed)
                 self.base_url_input.textChanged.connect(self._on_runtime_text_changed)
                 self.proxy_input.textChanged.connect(self._on_runtime_text_changed)
                 self.mouse_button_combo.currentIndexChanged.connect(self._on_draw_mouse_button_changed)
+                self.speed_profile_combo.currentIndexChanged.connect(self._on_draw_speed_profile_changed)
                 self._refresh_hotkey_labels()
 
                 self.paste_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+V"), self)
@@ -278,10 +387,34 @@ class MainWindowFactory:
                 self.paste_shortcut.activated.connect(self._paste_image_from_clipboard)
 
                 self._register_hotkeys()
+                self._sync_runtime_control_states()
 
             def resizeEvent(self, event) -> None:
                 super().resizeEvent(event)
+                self._update_busy_overlay_geometry()
                 self._refresh_preview_pixmaps()
+
+            def showEvent(self, event) -> None:
+                super().showEvent(event)
+                self._center_on_first_show()
+
+            def _update_busy_overlay_geometry(self) -> None:
+                if self.centralWidget() is not None and hasattr(self, "busy_overlay"):
+                    self.busy_overlay.setGeometry(self.centralWidget().rect())
+
+            def _center_on_first_show(self) -> None:
+                if self._has_centered_on_first_show:
+                    return
+                screen = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos())
+                if screen is None:
+                    screen = QtGui.QGuiApplication.primaryScreen()
+                if screen is None:
+                    return
+                available = screen.availableGeometry()
+                x = available.x() + max((available.width() - self.width()) // 2, 0)
+                y = available.y() + max((available.height() - self.height()) // 2, 0)
+                self.move(x, y)
+                self._has_centered_on_first_show = True
 
             def keyPressEvent(self, event) -> None:
                 if self._recording_hotkey_name is not None:
@@ -407,6 +540,7 @@ class MainWindowFactory:
                         controller.session.hotkeys["calibrate"]: lambda: self._queue_hotkey_action("calibrate"),
                         controller.session.hotkeys["start"]: lambda: self._queue_hotkey_action("start"),
                         controller.session.hotkeys["stop"]: self._stop_from_hotkey,
+                        controller.session.hotkeys["pause"]: self._toggle_pause_from_hotkey,
                     }
                 )
                 for action, hotkey in controller.session.hotkeys.items():
@@ -432,13 +566,20 @@ class MainWindowFactory:
             def _stop_from_hotkey(self) -> None:
                 self._request_stop()
 
+            def _toggle_pause_from_hotkey(self) -> None:
+                controller.toggle_pause()
+
             def _request_stop(self) -> None:
                 controller.cancel()
                 self.execution_status_changed.emit(controller.session.status)
 
+            def _toggle_pause(self) -> None:
+                controller.toggle_pause()
+
             def _run_drawing(self) -> None:
                 try:
                     controller.start_drawing(status_callback=self.execution_status_changed.emit)
+                    self.execution_status_changed.emit(controller.session.status)
                 except Exception as exc:  # pragma: no cover
                     self.execution_error.emit(self._format_error(exc))
 
@@ -453,18 +594,69 @@ class MainWindowFactory:
                 self.line_art_generation_succeeded.emit(controller.session.line_art)
 
             def _set_line_art_generation_controls_enabled(self, enabled: bool) -> None:
-                self.line_art_button.setEnabled(enabled)
-                self.preview_button.setEnabled(enabled)
-                self.start_button.setEnabled(enabled)
+                self._line_art_busy = not enabled
+                self._sync_runtime_control_states()
+
+            def _run_preview_preparation(self) -> None:
+                self.preview_preparation_busy.emit(True)
+                try:
+                    preview = controller.prepare_preview()
+                except Exception as exc:  # pragma: no cover
+                    self.preview_preparation_failed.emit(self._format_error(exc))
+                    return
+                self.preview_preparation_succeeded.emit(preview)
+
+            def _set_preview_preparation_controls_enabled(self, enabled: bool) -> None:
+                self._preview_busy = not enabled
+                self._sync_runtime_control_states()
+
+            def _sync_runtime_control_states(self) -> None:
+                drawing_active = controller.session.status in {"countdown", "running", "paused"}
+                busy = self._line_art_busy or self._preview_busy
+                runtime_controls_enabled = not busy and not drawing_active
+
+                self.line_art_button.setEnabled(runtime_controls_enabled)
+                self.preview_button.setEnabled(runtime_controls_enabled)
+                self.original_preview_label.setEnabled(runtime_controls_enabled)
+                self.api_key_input.setEnabled(runtime_controls_enabled)
+                self.model_input.setEnabled(runtime_controls_enabled)
+                self.base_url_input.setEnabled(runtime_controls_enabled)
+                self.proxy_input.setEnabled(runtime_controls_enabled)
+                self.fill_proxy_button.setEnabled(runtime_controls_enabled)
+                self.mouse_button_combo.setEnabled(runtime_controls_enabled)
+                self.speed_profile_combo.setEnabled(runtime_controls_enabled)
+                for button in self.hotkey_record_buttons.values():
+                    button.setEnabled(runtime_controls_enabled)
+
+                if busy:
+                    self.start_button.setEnabled(False)
+                else:
+                    self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(drawing_active)
+                self._update_start_button()
+
+            def _update_start_button(self) -> None:
+                if controller.session.status == "paused":
+                    self.start_button.setText("继续绘制")
+                    return
+                if controller.session.status in {"countdown", "running"}:
+                    self.start_button.setText("暂停绘制")
+                    return
+                self.start_button.setText("开始绘制")
 
             def _on_line_art_generation_busy(self, is_busy: bool) -> None:
                 self._set_line_art_generation_controls_enabled(not is_busy)
                 if is_busy:
+                    self.busy_overlay.show_message("正在生成线稿...")
                     self.status_value_label.setText("正在生成线稿...")
+                else:
+                    self.busy_overlay.hide_overlay()
+                self._sync_runtime_control_states()
 
             def _on_line_art_generation_succeeded(self, line_art) -> None:
                 self._line_art_thread = None
                 self._set_line_art_generation_controls_enabled(True)
+                self.busy_overlay.hide_overlay()
                 if line_art is not None:
                     self._set_line_art_preview(line_art)
                 controller.session.active_region = None
@@ -474,25 +666,72 @@ class MainWindowFactory:
                 self.region_value_label.setText("未选择")
                 self.preview_value_label.setText("待生成")
 
+                self._sync_runtime_control_states()
+
             def _on_line_art_generation_failed(self, message: str) -> None:
                 self._line_art_thread = None
                 self._set_line_art_generation_controls_enabled(True)
+                self.busy_overlay.hide_overlay()
+                self.status_value_label.setText(message)
+                self._sync_runtime_control_states()
+
+            def _on_preview_preparation_busy(self, is_busy: bool) -> None:
+                self._set_preview_preparation_controls_enabled(not is_busy)
+                if is_busy:
+                    self.busy_overlay.show_message("正在生成预览...")
+                    self.status_value_label.setText("正在生成预览...")
+                else:
+                    self.busy_overlay.hide_overlay()
+
+                self._sync_runtime_control_states()
+
+            def _on_preview_preparation_succeeded(self, preview: object) -> None:
+                self._preview_thread = None
+                self._preview_restore_state = None
+                self._set_preview_preparation_controls_enabled(True)
+                self.busy_overlay.hide_overlay()
+                segment_count = getattr(preview, "segment_count", None)
+                if segment_count is None and isinstance(preview, dict):
+                    segment_count = preview.get("segment_count")
+                self.status_value_label.setText("预览定位已确认")
+                self.preview_value_label.setText(f"{segment_count or 0} 段路径")
+
+                self._sync_runtime_control_states()
+
+            def _on_preview_preparation_failed(self, message: str) -> None:
+                if self._preview_restore_state is not None:
+                    controller.session.active_region = self._preview_restore_state["active_region"]
+                    controller.session.preview_scale = self._preview_restore_state["preview_scale"]
+                    controller.session.stroke_plan = self._preview_restore_state["stroke_plan"]
+                    controller.session.last_preview = self._preview_restore_state["last_preview"]
+                    self.region_value_label.setText(self._preview_restore_state["region_label"])
+                    self.preview_value_label.setText(self._preview_restore_state["preview_label"])
+                self._preview_restore_state = None
+                self._preview_thread = None
+                self._set_preview_preparation_controls_enabled(True)
+                self.busy_overlay.hide_overlay()
                 self.status_value_label.setText(message)
 
+                self._sync_runtime_control_states()
+
             def _on_execution_status_changed(self, status: str) -> None:
+                controller.session.status = status
                 status_map = {
                     "countdown": "倒计时中",
                     "running": "正在绘制",
                     "cancelled": "已停止",
                     "completed": "绘制完成",
                 }
+                status_map["paused"] = "已暂停绘制"
                 self.status_value_label.setText(status_map.get(status, status))
                 if status in {"cancelled", "completed"}:
                     self._draw_thread = None
+                self._sync_runtime_control_states()
 
             def _on_execution_error(self, message: str) -> None:
                 self.status_value_label.setText(message)
                 self._draw_thread = None
+                self._sync_runtime_control_states()
 
             def _hotkey_update_status(self, action: str) -> str:
                 status = controller.session.hotkey_statuses[action]
@@ -529,6 +768,7 @@ class MainWindowFactory:
                 return UserSettings(
                     hotkeys=dict(controller.session.hotkeys),
                     draw_mouse_button=controller.session.draw_mouse_button,
+                    draw_speed_profile=controller.session.draw_speed_profile,
                     api_key=self.api_key_input.text().strip(),
                     proxy_url=self.proxy_input.text().strip() or None,
                     model=self.model_input.text().strip(),
@@ -547,6 +787,13 @@ class MainWindowFactory:
 
             def _on_draw_mouse_button_changed(self, _index=None) -> None:
                 controller.session.draw_mouse_button = self.mouse_button_combo.currentData()
+                self._save_runtime_settings()
+
+            def _on_draw_speed_profile_changed(self, _index=None) -> None:
+                controller.session.draw_speed_profile = self.speed_profile_combo.currentData()
+                controller.draw_executor.settings = executor_settings_for_profile(
+                    controller.session.draw_speed_profile
+                )
                 self._save_runtime_settings()
 
             def _fill_local_proxy(self) -> None:
@@ -670,7 +917,42 @@ class MainWindowFactory:
                 self.status_value_label.setText("预览定位已确认")
                 self.preview_value_label.setText(f"{segment_count or 0} 段路径")
 
+            def _preview(self) -> None:
+                if controller.session.line_art is None:
+                    self.status_value_label.setText("请先生成线稿")
+                    return
+                if self._preview_thread is not None and self._preview_thread.is_alive():
+                    self.status_value_label.setText("正在生成预览...")
+                    return
+
+                try:
+                    placement = calibrator.place_preview(
+                        controller.session.line_art,
+                        initial_scale=controller.session.preview_scale or 1.0,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    self.status_value_label.setText(self._format_error(exc))
+                    return
+
+                self._preview_restore_state = {
+                    "active_region": controller.session.active_region,
+                    "preview_scale": controller.session.preview_scale,
+                    "stroke_plan": controller.session.stroke_plan,
+                    "last_preview": controller.session.last_preview,
+                    "region_label": self.region_value_label.text(),
+                    "preview_label": self.preview_value_label.text(),
+                }
+                controller.set_region(placement.region)
+                controller.session.preview_scale = placement.scale
+                self.region_value_label.setText(f"{placement.region.width} × {placement.region.height}")
+                self._on_preview_preparation_busy(True)
+                self._preview_thread = threading.Thread(target=self._run_preview_preparation, daemon=True)
+                self._preview_thread.start()
+
             def _start(self) -> None:
+                if controller.session.status in {"countdown", "running", "paused"}:
+                    self._toggle_pause()
+                    return
                 if self._draw_thread is not None and self._draw_thread.is_alive():
                     self.status_value_label.setText("正在绘制")
                     return
@@ -678,15 +960,26 @@ class MainWindowFactory:
                 self._draw_thread.start()
                 self.status_value_label.setText("正在绘制")
 
+                self._sync_runtime_control_states()
+
             def closeEvent(self, event) -> None:
                 event.accept()
+
+            def _update_start_button(self) -> None:
+                if controller.session.status == "paused":
+                    self.start_button.setText("继续绘制")
+                    return
+                if controller.session.status in {"countdown", "running"}:
+                    self.start_button.setText("暂停绘制")
+                    return
+                self.start_button.setText("开始绘制")
 
             def _create_card(self, object_name: str, title: str, subtitle: str):
                 card = QtWidgets.QFrame()
                 card.setObjectName(object_name)
                 card_layout = QtWidgets.QVBoxLayout(card)
-                card_layout.setContentsMargins(16, 16, 16, 16)
-                card_layout.setSpacing(10)
+                card_layout.setContentsMargins(14, 14, 14, 14)
+                card_layout.setSpacing(8)
 
                 title_label = QtWidgets.QLabel(title)
                 title_label.setObjectName("card_title")
@@ -708,8 +1001,8 @@ class MainWindowFactory:
                 card = QtWidgets.QFrame()
                 card.setObjectName("preview_card")
                 card_layout = QtWidgets.QVBoxLayout(card)
-                card_layout.setContentsMargins(14, 14, 14, 14)
-                card_layout.setSpacing(10)
+                card_layout.setContentsMargins(12, 12, 12, 12)
+                card_layout.setSpacing(8)
 
                 title_label = QtWidgets.QLabel(title)
                 title_label.setObjectName("preview_title")
@@ -717,7 +1010,7 @@ class MainWindowFactory:
                 preview_label.setObjectName(preview_object_name)
                 preview_label.setAlignment(QtCore.Qt.AlignCenter)
                 preview_label.setWordWrap(True)
-                preview_label.setMinimumHeight(280)
+                preview_label.setMinimumHeight(220)
                 preview_label.setText(empty_text)
 
                 card_layout.addWidget(title_label)
@@ -865,6 +1158,19 @@ class MainWindowFactory:
                         border: none;
                     }
                     QPushButton#primary_button:hover { background: #c97744; }
+                    QWidget#busy_overlay {
+                        background: rgba(28, 24, 21, 150);
+                    }
+                    QFrame#busy_overlay_panel {
+                        background: rgba(43, 36, 31, 230);
+                        border: 1px solid rgba(255, 220, 191, 90);
+                        border-radius: 20px;
+                    }
+                    QLabel#busy_overlay_message {
+                        color: #fff8ef;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
                     """
                 )
 

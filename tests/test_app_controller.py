@@ -1,7 +1,7 @@
 import unittest
 
 from sts_draw.app_controller import AppController
-from sts_draw.models import CalibrationRegion, LineArtResult, StrokePlan
+from sts_draw.models import CalibrationRegion, LineArtResult, MoveStroke, StrokePlan
 
 
 class FakeGeminiClient:
@@ -17,15 +17,23 @@ class FakePreviewRenderer:
 class FakeExecutor:
     def __init__(self) -> None:
         self.started = False
+        self.pause_calls = 0
+        self.resume_calls = 0
 
     def start(self, session) -> None:
         self.started = True
         session.status = "running"
 
+    def pause(self) -> None:
+        self.pause_calls += 1
+
+    def resume(self) -> None:
+        self.resume_calls += 1
+
 
 class FakeStrokePlanner:
     def __init__(self) -> None:
-        self.segments = []
+        self.segments = [MoveStroke(point=(0, 0))]
 
     def plan(self, matrix, region):
         return StrokePlan(segments=self.segments, source_size=(1, 1), region=region)
@@ -66,7 +74,25 @@ class AppControllerTests(unittest.TestCase):
         preview = controller.prepare_preview()
 
         self.assertEqual(controller.session.status, "ready")
-        self.assertEqual(preview["segment_count"], 0)
+        self.assertEqual(preview["segment_count"], 1)
+
+    def test_toggle_pause_dispatches_based_on_session_status(self) -> None:
+        executor = FakeExecutor()
+        controller = AppController(
+            gemini_client=FakeGeminiClient(),
+            stroke_planner=FakeStrokePlanner(),
+            preview_renderer=FakePreviewRenderer(),
+            draw_executor=executor,
+            line_art_matrix_factory=FakeMatrixFactory(),
+        )
+
+        controller.session.status = "running"
+        controller.toggle_pause()
+        controller.session.status = "paused"
+        controller.toggle_pause()
+
+        self.assertEqual(executor.pause_calls, 1)
+        self.assertEqual(executor.resume_calls, 1)
 
 
 class LineArtMatrixFactoryTests(unittest.TestCase):

@@ -91,6 +91,12 @@ class AppController:
         self.draw_executor.cancel()
         self.session.cancel("hotkey")
 
+    def toggle_pause(self) -> None:
+        if self.session.status == "paused":
+            self.draw_executor.resume()
+            return
+        self.draw_executor.pause()
+
     @property
     def current_plan(self) -> StrokePlan | None:
         return self.session.stroke_plan

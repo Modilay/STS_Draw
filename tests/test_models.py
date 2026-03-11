@@ -1,6 +1,6 @@
 import unittest
 
-from sts_draw.models import CalibrationRegion, ExecutionSession, LineArtResult, StrokeSegment
+from sts_draw.models import BezierStroke, CalibrationRegion, ExecutionSession, LineArtResult, LineStroke, MoveStroke
 
 
 class CalibrationRegionTests(unittest.TestCase):
@@ -12,11 +12,29 @@ class CalibrationRegionTests(unittest.TestCase):
         self.assertEqual(point, (200, 150))
 
 
-class StrokeSegmentTests(unittest.TestCase):
-    def test_estimates_duration_from_distance_and_speed(self) -> None:
-        segment = StrokeSegment(start=(0, 0), end=(300, 400), pen_down=True, speed_pixels_per_second=250)
+class StrokeTests(unittest.TestCase):
+    def test_line_stroke_estimates_duration_from_distance_and_speed(self) -> None:
+        segment = LineStroke(start=(0, 0), end=(300, 400), speed_pixels_per_second=250)
 
         self.assertEqual(segment.estimated_duration_ms, 2000)
+        self.assertFalse(segment.continues_path)
+
+    def test_move_stroke_has_no_duration(self) -> None:
+        stroke = MoveStroke(point=(12, 34))
+
+        self.assertEqual(stroke.estimated_duration_ms, 0)
+
+    def test_bezier_stroke_estimates_non_zero_duration(self) -> None:
+        stroke = BezierStroke(
+            start=(0, 0),
+            control1=(20, 40),
+            control2=(40, 40),
+            end=(60, 0),
+            speed_pixels_per_second=120,
+        )
+
+        self.assertGreater(stroke.estimated_duration_ms, 0)
+        self.assertFalse(stroke.continues_path)
 
 
 class ExecutionSessionTests(unittest.TestCase):
@@ -37,6 +55,17 @@ class ExecutionSessionTests(unittest.TestCase):
         session = ExecutionSession()
 
         self.assertIsNone(session.preview_scale)
+
+    def test_defaults_draw_speed_profile_to_balanced(self) -> None:
+        session = ExecutionSession()
+
+        self.assertEqual(session.draw_speed_profile, "balanced")
+
+    def test_defaults_pause_hotkey_to_ctrl_alt_p(self) -> None:
+        session = ExecutionSession()
+
+        self.assertEqual(session.hotkeys["pause"], "ctrl+alt+p")
+        self.assertIn("pause", session.hotkey_statuses)
 
 
 class LineArtResultTests(unittest.TestCase):

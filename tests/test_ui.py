@@ -9,7 +9,7 @@ from sts_draw.app_controller import AppController
 from sts_draw.canvas_calibrator import CanvasCalibrator
 from sts_draw.global_hotkeys import HotkeyCheckResult
 from sts_draw.image_generation_client import OpenAICompatibleClient, OpenAICompatibleSettings
-from sts_draw.models import CalibrationRegion, LineArtResult, PreviewPlacementResult, StrokePlan, StrokeSegment
+from sts_draw.models import CalibrationRegion, LineStroke, LineArtResult, MoveStroke, PreviewPlacementResult, StrokePlan
 from sts_draw.preview_renderer import PreviewRenderer
 from sts_draw.stroke_planner import StrokePlanner
 from sts_draw.ui import MainWindowFactory
@@ -41,11 +41,18 @@ class FakeDrawExecutor:
     def __init__(self) -> None:
         self.start_thread_ids = []
         self.cancel_thread_ids = []
+        self.pause_thread_ids = []
+        self.resume_thread_ids = []
         self.started = threading.Event()
         self.finish = threading.Event()
+        self.settings = None
+        self.active_session = None
+        self.status_callback = None
 
     def start(self, session, status_callback=None) -> None:
         self.start_thread_ids.append(threading.get_ident())
+        self.active_session = session
+        self.status_callback = status_callback
         self.started.set()
         if status_callback is not None:
             status_callback('running')
@@ -58,6 +65,20 @@ class FakeDrawExecutor:
 
     def cancel(self) -> None:
         self.cancel_thread_ids.append(threading.get_ident())
+
+    def pause(self) -> None:
+        self.pause_thread_ids.append(threading.get_ident())
+        if self.active_session is not None:
+            self.active_session.status = 'paused'
+        if self.status_callback is not None:
+            self.status_callback('paused')
+
+    def resume(self) -> None:
+        self.resume_thread_ids.append(threading.get_ident())
+        if self.active_session is not None:
+            self.active_session.status = 'running'
+        if self.status_callback is not None:
+            self.status_callback('running')
 
 
 class FakeMimeData:
@@ -122,6 +143,25 @@ class FakeLineArtGenerator:
             raise self.error
 
 
+class FakePreviewPreparer:
+    def __init__(self, preview) -> None:
+        self.preview = preview
+        self.calls = 0
+        self.thread_ids = []
+        self.started = threading.Event()
+        self.finish = threading.Event()
+        self.error: Exception | None = None
+
+    def __call__(self):
+        self.calls += 1
+        self.thread_ids.append(threading.get_ident())
+        self.started.set()
+        self.finish.wait(timeout=2)
+        if self.error is not None:
+            raise self.error
+        return self.preview
+
+
 class MainWindowFactoryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -159,9 +199,15 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertEqual(window.line_art_preview_label.objectName(), 'line_art_preview')
         self.assertEqual(window.shortcut_card.objectName(), 'shortcut_panel')
         self.assertEqual(window.hotkey_value_labels['stop'].text(), 'Ctrl+Alt+S')
+        self.assertEqual(window.hotkey_value_labels['pause'].text(), 'Ctrl+Alt+P')
         self.assertIn('stop', window.hotkey_status_labels)
+        self.assertIn('pause', window.hotkey_status_labels)
         self.assertEqual(window.mouse_button_combo.currentData(), 'left')
+        self.assertTrue(hasattr(window, 'busy_overlay'))
+        self.assertTrue(hasattr(window, 'busy_spinner'))
+        self.assertTrue(hasattr(window, 'busy_message_label'))
         self.assertFalse(hasattr(window, 'calibrate_button'))
+        self.assertTrue(hasattr(window, 'stop_button'))
 
     def test_fill_proxy_button_updates_proxy_input_and_persists(self) -> None:
         from sts_draw.user_settings import UserSettingsStore
@@ -213,6 +259,9 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertFalse(window.line_art_button.isEnabled())
         self.assertFalse(window.preview_button.isEnabled())
         self.assertFalse(window.start_button.isEnabled())
+        self.assertFalse(window.busy_overlay.isHidden())
+        self.assertEqual(window.busy_message_label.text(), '正在生成线稿...')
+        self.assertTrue(window.busy_spinner.is_spinning())
         self.assertEqual(window.status_value_label.text(), '正在生成线稿...')
         generator.finish.set()
         self._wait_for(lambda: window.line_art_button.isEnabled(), timeout=1)
@@ -223,6 +272,9 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertIsNotNone(controller.session.line_art)
         self.assertFalse(window.line_art_preview_label.pixmap().isNull())
         self.assertIn('线稿已生成', window.status_value_label.text())
+
+        self.assertTrue(window.busy_overlay.isHidden())
+        self.assertFalse(window.busy_spinner.is_spinning())
 
     def test_generate_line_art_runs_in_background_thread(self) -> None:
         window = self._build_window()
@@ -282,12 +334,20 @@ class MainWindowFactoryTests(unittest.TestCase):
         self._wait_for(lambda: window._line_art_thread is None, timeout=1)
 
     def test_window_restores_saved_runtime_settings(self) -> None:
+        from sts_draw import draw_executor
         from sts_draw.user_settings import UserSettings, UserSettingsStore
 
         settings_store = UserSettingsStore(self.temp_dir / 'settings.json')
         settings_store.save(
             UserSettings(
-                hotkeys={'calibrate': 'ctrl+alt+c', 'start': 'ctrl+alt+d', 'stop': 'ctrl+alt+s'},
+                hotkeys={
+                    'calibrate': 'ctrl+alt+c',
+                    'start': 'ctrl+alt+d',
+                    'stop': 'ctrl+alt+s',
+                    'pause': 'ctrl+shift+p',
+                },
+                draw_mouse_button='right',
+                draw_speed_profile='fast',
                 api_key='saved-key',
                 proxy_url='http://127.0.0.1:7890',
                 model='google/gemini-custom',
@@ -301,10 +361,20 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertEqual(window.proxy_input.text(), 'http://127.0.0.1:7890')
         self.assertEqual(window.model_input.text(), 'google/gemini-custom')
         self.assertEqual(window.base_url_input.text(), 'https://example.com/v1')
+        self.assertEqual(window.mouse_button_combo.currentData(), 'right')
+        self.assertEqual(window.speed_profile_combo.currentData(), 'fast')
         self.assertEqual(window._controller.image_generation_client.settings.api_key, 'saved-key')
         self.assertEqual(window._controller.image_generation_client.settings.proxy_url, 'http://127.0.0.1:7890')
         self.assertEqual(window._controller.image_generation_client.settings.model, 'google/gemini-custom')
         self.assertEqual(window._controller.image_generation_client.settings.base_url, 'https://example.com/v1')
+        self.assertEqual(window._controller.session.draw_mouse_button, 'right')
+        self.assertEqual(window._controller.session.draw_speed_profile, 'fast')
+        self.assertEqual(window._controller.session.hotkeys['pause'], 'ctrl+shift+p')
+        self.assertEqual(window.hotkey_value_labels['pause'].text(), 'Ctrl+Shift+P')
+        self.assertEqual(
+            window._controller.draw_executor.settings,
+            draw_executor.executor_settings_for_profile('fast'),
+        )
 
     def test_api_key_input_persists_immediately(self) -> None:
         from sts_draw.user_settings import UserSettingsStore
@@ -335,8 +405,19 @@ class MainWindowFactoryTests(unittest.TestCase):
         window = self._build_window(calibrator=calibrator)
         controller = window._controller
         controller.session.line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
-        controller.prepare_preview = lambda: {'segment_count': 9}
+        preview_preparer = FakePreviewPreparer({'segment_count': 9})
+        controller.prepare_preview = preview_preparer
         window._preview()
+        self.assertTrue(preview_preparer.started.wait(timeout=1))
+        self.assertFalse(window.preview_button.isEnabled())
+        self.assertFalse(window.line_art_button.isEnabled())
+        self.assertFalse(window.start_button.isEnabled())
+        self.assertFalse(window.busy_overlay.isHidden())
+        self.assertEqual(window.busy_message_label.text(), '正在生成预览...')
+        self.assertTrue(window.busy_spinner.is_spinning())
+        self.assertEqual(window.status_value_label.text(), '正在生成预览...')
+        preview_preparer.finish.set()
+        self._wait_for(lambda: window.preview_button.isEnabled(), timeout=1)
         self.assertIs(calibrator.last_line_art, controller.session.line_art)
         self.assertEqual(calibrator.last_initial_scale, 1.0)
         self.assertEqual(controller.session.active_region, calibrator.placement.region)
@@ -344,6 +425,64 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertIn('30', window.region_value_label.text())
         self.assertIn('40', window.region_value_label.text())
         self.assertIn('9', window.preview_value_label.text())
+        self.assertTrue(window.busy_overlay.isHidden())
+        self.assertFalse(window.busy_spinner.is_spinning())
+
+    def test_preview_runs_prepare_preview_in_background_thread(self) -> None:
+        calibrator = FakePlacementCalibrator()
+        window = self._build_window(calibrator=calibrator)
+        controller = window._controller
+        controller.session.line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        preview_preparer = FakePreviewPreparer({'segment_count': 2})
+        controller.prepare_preview = preview_preparer
+        main_thread_id = threading.get_ident()
+
+        window._preview()
+
+        self.assertTrue(preview_preparer.started.wait(timeout=1))
+        self.assertNotEqual(preview_preparer.thread_ids, [main_thread_id])
+        preview_preparer.finish.set()
+        self._wait_for(lambda: window._preview_thread is None, timeout=1)
+
+    def test_preview_failure_restores_controls_and_keeps_existing_summary(self) -> None:
+        calibrator = FakePlacementCalibrator()
+        window = self._build_window(calibrator=calibrator)
+        controller = window._controller
+        controller.session.line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        controller.session.active_region = CalibrationRegion(1, 2, 3, 4)
+        controller.session.preview_scale = 2.0
+        window.region_value_label.setText('3 脳 4')
+        window.preview_value_label.setText('7 娈佃矾寰?')
+        preview_preparer = FakePreviewPreparer({'segment_count': 9})
+        preview_preparer.error = RuntimeError('Preview must be prepared first.')
+        controller.prepare_preview = preview_preparer
+
+        window._preview()
+
+        self.assertTrue(preview_preparer.started.wait(timeout=1))
+        preview_preparer.finish.set()
+        self._wait_for(lambda: window.preview_button.isEnabled(), timeout=1)
+        self.assertEqual(window.region_value_label.text(), '3 脳 4')
+        self.assertEqual(window.preview_value_label.text(), '7 娈佃矾寰?')
+        self.assertTrue(window.busy_overlay.isHidden())
+        self.assertFalse(window.busy_spinner.is_spinning())
+
+    def test_preview_ignores_reentrant_clicks(self) -> None:
+        calibrator = FakePlacementCalibrator()
+        window = self._build_window(calibrator=calibrator)
+        controller = window._controller
+        controller.session.line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        preview_preparer = FakePreviewPreparer({'segment_count': 5})
+        controller.prepare_preview = preview_preparer
+
+        window._preview()
+        self.assertTrue(preview_preparer.started.wait(timeout=1))
+        window._preview()
+
+        self.assertEqual(preview_preparer.calls, 1)
+        self.assertEqual(window.status_value_label.text(), '正在生成预览...')
+        preview_preparer.finish.set()
+        self._wait_for(lambda: window._preview_thread is None, timeout=1)
 
     def test_cancelled_preview_keeps_existing_state(self) -> None:
         calibrator = FakePlacementCalibrator()
@@ -421,16 +560,35 @@ class MainWindowFactoryTests(unittest.TestCase):
         saved = UserSettingsStore(window._settings_store.path).load()
         self.assertEqual(saved.draw_mouse_button, 'right')
 
+    def test_speed_profile_selection_updates_session_executor_and_persists(self) -> None:
+        from sts_draw import draw_executor
+        from sts_draw.user_settings import UserSettingsStore
+
+        window = self._build_window()
+        window.speed_profile_combo.setCurrentIndex(2)
+
+        self.assertEqual(window._controller.session.draw_speed_profile, 'fast')
+        self.assertEqual(
+            window._controller.draw_executor.settings,
+            draw_executor.executor_settings_for_profile('fast'),
+        )
+        saved = UserSettingsStore(window._settings_store.path).load()
+        self.assertEqual(saved.draw_speed_profile, 'fast')
+
     def test_calibrate_hotkey_dispatches_back_to_main_thread(self) -> None:
         calibrator = FakePlacementCalibrator()
         window = self._build_window(calibrator=calibrator)
         window._controller.session.line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
-        window._controller.prepare_preview = lambda: {'segment_count': 3}
+        preview_preparer = FakePreviewPreparer({'segment_count': 3})
+        window._controller.prepare_preview = preview_preparer
         main_thread_id = threading.get_ident()
         hotkey = window._controller.session.hotkeys['calibrate']
         worker = threading.Thread(target=window._hotkeys_manager.mapping[hotkey])
         worker.start(); worker.join(); self.qt_app.processEvents()
         self.assertEqual(calibrator.called_thread_ids, [main_thread_id])
+        self.assertTrue(preview_preparer.started.wait(timeout=1))
+        preview_preparer.finish.set()
+        self._wait_for(lambda: window._preview_thread is None, timeout=1)
         self.assertIn('3', window.preview_value_label.text())
 
     def test_start_hotkey_dispatches_back_to_main_thread(self) -> None:
@@ -456,6 +614,33 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotEqual(calls[0], main_thread_id)
 
+    def test_pause_hotkey_toggles_without_waiting_for_main_thread(self) -> None:
+        window = self._build_window()
+        window._controller.session.stroke_plan = self._make_stroke_plan()
+        main_thread_id = threading.get_ident()
+
+        window._start()
+        self.assertTrue(window._controller.draw_executor.started.wait(timeout=1))
+
+        pause_hotkey = window._controller.session.hotkeys['pause']
+        worker = threading.Thread(target=window._hotkeys_manager.mapping[pause_hotkey])
+        worker.start(); worker.join()
+        self._wait_for(lambda: window._controller.session.status == 'paused', timeout=1)
+
+        self.assertEqual(len(window._controller.draw_executor.pause_thread_ids), 1)
+        self.assertNotEqual(window._controller.draw_executor.pause_thread_ids[0], main_thread_id)
+        self.assertEqual(window.start_button.text(), '继续绘制')
+
+        worker = threading.Thread(target=window._hotkeys_manager.mapping[pause_hotkey])
+        worker.start(); worker.join()
+        self._wait_for(lambda: window._controller.session.status == 'running', timeout=1)
+
+        self.assertEqual(len(window._controller.draw_executor.resume_thread_ids), 1)
+        self.assertNotEqual(window._controller.draw_executor.resume_thread_ids[0], main_thread_id)
+        self.assertEqual(window.start_button.text(), '暂停绘制')
+        window._controller.draw_executor.finish.set()
+        self._wait_for(lambda: window._controller.session.status == 'completed', timeout=1)
+
     def test_start_runs_drawing_in_background_thread(self) -> None:
         window = self._build_window()
         main_thread_id = threading.get_ident()
@@ -465,6 +650,72 @@ class MainWindowFactoryTests(unittest.TestCase):
         self.assertNotEqual(window._controller.draw_executor.start_thread_ids, [main_thread_id])
         window._controller.draw_executor.finish.set()
         self._wait_for(lambda: window._controller.session.status == 'completed', timeout=1)
+
+    def test_start_button_toggles_pause_and_resume_and_disables_runtime_controls(self) -> None:
+        window = self._build_window()
+        window._controller.session.stroke_plan = self._make_stroke_plan()
+
+        self.assertEqual(window.start_button.text(), '开始绘制')
+        self.assertEqual(window.size().width(), 1120)
+        self.assertEqual(window.size().height(), 700)
+        self.assertEqual(window.original_preview_label.minimumHeight(), 220)
+
+        window._start()
+        self.assertTrue(window._controller.draw_executor.started.wait(timeout=1))
+        self._wait_for(lambda: window._controller.session.status == 'running', timeout=1)
+
+        self.assertEqual(window.start_button.text(), '暂停绘制')
+        self.assertFalse(window.line_art_button.isEnabled())
+        self.assertFalse(window.preview_button.isEnabled())
+        self.assertFalse(window.mouse_button_combo.isEnabled())
+        self.assertFalse(window.speed_profile_combo.isEnabled())
+        self.assertFalse(window.original_preview_label.isEnabled())
+        self.assertFalse(window.hotkey_record_buttons['pause'].isEnabled())
+        self.assertTrue(window.stop_button.isEnabled())
+
+        window._start()
+        self._wait_for(lambda: window._controller.session.status == 'paused', timeout=1)
+        self.assertEqual(window.start_button.text(), '继续绘制')
+        self.assertFalse(window.line_art_button.isEnabled())
+        self.assertFalse(window.preview_button.isEnabled())
+
+        window._start()
+        self._wait_for(lambda: window._controller.session.status == 'running', timeout=1)
+        self.assertEqual(window.start_button.text(), '暂停绘制')
+
+        window._controller.draw_executor.finish.set()
+        self._wait_for(lambda: window._controller.session.status == 'completed', timeout=1)
+        self.assertEqual(window.start_button.text(), '开始绘制')
+        self.assertTrue(window.line_art_button.isEnabled())
+        self.assertTrue(window.preview_button.isEnabled())
+        self.assertTrue(window.mouse_button_combo.isEnabled())
+        self.assertTrue(window.speed_profile_combo.isEnabled())
+        self.assertTrue(window.original_preview_label.isEnabled())
+        self.assertTrue(window.hotkey_record_buttons['pause'].isEnabled())
+        self.assertFalse(window.stop_button.isEnabled())
+
+    def test_window_centers_to_active_screen_on_first_show(self) -> None:
+        from PySide6 import QtCore
+        from unittest.mock import Mock
+
+        window = self._build_window()
+        fake_screen = Mock()
+        fake_screen.availableGeometry.return_value = QtCore.QRect(100, 80, 1600, 900)
+
+        with patch('PySide6.QtGui.QGuiApplication.screenAt', return_value=fake_screen):
+            with patch('PySide6.QtGui.QGuiApplication.primaryScreen', return_value=fake_screen):
+                window._center_on_first_show()
+
+        self.assertEqual(window.pos().x(), 340)
+        self.assertEqual(window.pos().y(), 180)
+
+        window.move(0, 0)
+        with patch('PySide6.QtGui.QGuiApplication.screenAt', return_value=fake_screen):
+            with patch('PySide6.QtGui.QGuiApplication.primaryScreen', return_value=fake_screen):
+                window._center_on_first_show()
+
+        self.assertEqual(window.pos().x(), 0)
+        self.assertEqual(window.pos().y(), 0)
 
     def test_stop_hotkey_updates_status_after_background_cancel(self) -> None:
         window = self._build_window()
@@ -495,13 +746,18 @@ class MainWindowFactoryTests(unittest.TestCase):
         return window
 
     def _make_stroke_plan(self):
-        return StrokePlan([StrokeSegment((0, 0), (10, 10), True)], (10, 10), CalibrationRegion(0, 0, 10, 10))
+        return StrokePlan(
+            [MoveStroke(point=(0, 0)), LineStroke(start=(0, 0), end=(10, 10), speed_pixels_per_second=250)],
+            (10, 10),
+            CalibrationRegion(0, 0, 10, 10),
+        )
 
     def _wait_for(self, predicate, timeout):
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.qt_app.processEvents()
             if predicate():
+                self.qt_app.processEvents()
                 return
             time.sleep(0.01)
         self.fail('Condition was not met before timeout.')

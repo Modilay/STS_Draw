@@ -21,7 +21,9 @@ class UserSettingsStoreTests(unittest.TestCase):
         self.assertEqual(settings.hotkeys["calibrate"], "ctrl+alt+c")
         self.assertEqual(settings.hotkeys["start"], "ctrl+alt+d")
         self.assertEqual(settings.hotkeys["stop"], "ctrl+alt+s")
+        self.assertEqual(settings.hotkeys["pause"], "ctrl+alt+p")
         self.assertEqual(settings.draw_mouse_button, "left")
+        self.assertEqual(settings.draw_speed_profile, "balanced")
         self.assertEqual(settings.api_key, "")
         self.assertIsNone(settings.proxy_url)
         self.assertTrue(settings.model)
@@ -37,8 +39,10 @@ class UserSettingsStoreTests(unittest.TestCase):
                     "calibrate": "ctrl+shift+c",
                     "start": "ctrl+shift+d",
                     "stop": "ctrl+shift+s",
+                    "pause": "ctrl+shift+p",
                 },
                 draw_mouse_button="right",
+                draw_speed_profile="fast",
                 api_key="sk-test",
                 proxy_url="http://127.0.0.1:7890",
                 model="google/gemini-custom",
@@ -51,7 +55,9 @@ class UserSettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.hotkeys["calibrate"], "ctrl+shift+c")
         self.assertEqual(loaded.hotkeys["start"], "ctrl+shift+d")
         self.assertEqual(loaded.hotkeys["stop"], "ctrl+shift+s")
+        self.assertEqual(loaded.hotkeys["pause"], "ctrl+shift+p")
         self.assertEqual(loaded.draw_mouse_button, "right")
+        self.assertEqual(loaded.draw_speed_profile, "fast")
         self.assertEqual(loaded.api_key, "sk-test")
         self.assertEqual(loaded.proxy_url, "http://127.0.0.1:7890")
         self.assertEqual(loaded.model, "google/gemini-custom")
@@ -65,7 +71,9 @@ class UserSettingsStoreTests(unittest.TestCase):
         loaded = UserSettingsStore(self.settings_path).load()
 
         self.assertEqual(loaded.hotkeys["stop"], "ctrl+alt+s")
+        self.assertEqual(loaded.hotkeys["pause"], "ctrl+alt+p")
         self.assertEqual(loaded.draw_mouse_button, "left")
+        self.assertEqual(loaded.draw_speed_profile, "balanced")
         self.assertEqual(loaded.api_key, "")
         self.assertIsNone(loaded.proxy_url)
 
@@ -85,11 +93,49 @@ class UserSettingsStoreTests(unittest.TestCase):
         loaded = UserSettingsStore(self.settings_path).load()
 
         self.assertEqual(loaded.hotkeys["stop"], "ctrl+shift+s")
+        self.assertEqual(loaded.hotkeys["pause"], "ctrl+alt+p")
         self.assertEqual(loaded.draw_mouse_button, "right")
+        self.assertEqual(loaded.draw_speed_profile, "balanced")
         self.assertEqual(loaded.api_key, "")
         self.assertIsNone(loaded.proxy_url)
         self.assertTrue(loaded.model)
         self.assertTrue(loaded.base_url)
+
+    def test_invalid_draw_speed_profile_falls_back_to_balanced(self) -> None:
+        from sts_draw.user_settings import UserSettingsStore
+
+        self.settings_path.write_text(
+            json.dumps(
+                {
+                    "draw_speed_profile": "warp",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = UserSettingsStore(self.settings_path).load()
+
+        self.assertEqual(loaded.draw_speed_profile, "balanced")
+
+    def test_missing_pause_hotkey_falls_back_to_default(self) -> None:
+        from sts_draw.user_settings import UserSettingsStore
+
+        self.settings_path.write_text(
+            json.dumps(
+                {
+                    "hotkeys": {
+                        "calibrate": "ctrl+shift+c",
+                        "start": "ctrl+shift+d",
+                        "stop": "ctrl+shift+s",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = UserSettingsStore(self.settings_path).load()
+
+        self.assertEqual(loaded.hotkeys["pause"], "ctrl+alt+p")
 
 
 if __name__ == "__main__":

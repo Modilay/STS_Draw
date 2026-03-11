@@ -11,7 +11,7 @@ from sts_draw.models import LineArtResult
 
 
 DEFAULT_PROMPT = """
-请将输入图像转换为适合路径提取和画布绘制的极简黑白线稿。
+请将输入图像转换为单线条骨架图（Centerline Drawing），目标是提取适合绘制的矢量路径。
 
 要求：
 - 保持原比例和大小

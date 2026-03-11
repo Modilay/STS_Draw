@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import dist
+from typing import TypeAlias
 
 DEFAULT_HOTKEYS = {
     "calibrate": "ctrl+alt+c",
     "start": "ctrl+alt+d",
     "stop": "ctrl+alt+s",
+    "pause": "ctrl+alt+p",
 }
 DEFAULT_DRAW_MOUSE_BUTTON = "left"
+DEFAULT_DRAW_SPEED_PROFILE = "balanced"
 
 
 @dataclass(slots=True)
@@ -50,11 +53,20 @@ class PreviewPlacementResult:
 
 
 @dataclass(slots=True)
-class StrokeSegment:
+class MoveStroke:
+    point: tuple[int, int]
+
+    @property
+    def estimated_duration_ms(self) -> int:
+        return 0
+
+
+@dataclass(slots=True)
+class LineStroke:
     start: tuple[int, int]
     end: tuple[int, int]
-    pen_down: bool
     speed_pixels_per_second: int = 250
+    continues_path: bool = False
 
     @property
     def estimated_duration_ms(self) -> int:
@@ -65,8 +77,57 @@ class StrokeSegment:
 
 
 @dataclass(slots=True)
+class BezierStroke:
+    start: tuple[int, int]
+    control1: tuple[int, int]
+    control2: tuple[int, int]
+    end: tuple[int, int]
+    speed_pixels_per_second: int = 250
+    continues_path: bool = False
+
+    @property
+    def estimated_duration_ms(self) -> int:
+        pixels = 0.0
+        previous = self.start
+        for point in self.sample_points(steps=16):
+            pixels += dist(previous, point)
+            previous = point
+        if self.speed_pixels_per_second <= 0:
+            return 0
+        return round((pixels / self.speed_pixels_per_second) * 1000)
+
+    def sample_points(self, steps: int = 16) -> list[tuple[int, int]]:
+        count = max(steps, 1)
+        points: list[tuple[int, int]] = []
+        for index in range(1, count + 1):
+            t = index / count
+            mt = 1.0 - t
+            x = (
+                (mt**3) * self.start[0]
+                + 3 * (mt**2) * t * self.control1[0]
+                + 3 * mt * (t**2) * self.control2[0]
+                + (t**3) * self.end[0]
+            )
+            y = (
+                (mt**3) * self.start[1]
+                + 3 * (mt**2) * t * self.control1[1]
+                + 3 * mt * (t**2) * self.control2[1]
+                + (t**3) * self.end[1]
+            )
+            point = (round(x), round(y))
+            if not points or point != points[-1]:
+                points.append(point)
+        if not points or points[-1] != self.end:
+            points.append(self.end)
+        return points
+
+
+Stroke: TypeAlias = MoveStroke | LineStroke | BezierStroke
+
+
+@dataclass(slots=True)
 class StrokePlan:
-    segments: list[StrokeSegment]
+    segments: list[Stroke]
     source_size: tuple[int, int]
     region: CalibrationRegion
 
@@ -96,6 +157,7 @@ class ExecutionSession:
         }
     )
     draw_mouse_button: str = DEFAULT_DRAW_MOUSE_BUTTON
+    draw_speed_profile: str = DEFAULT_DRAW_SPEED_PROFILE
     preview_scale: float | None = None
 
     def cancel(self, reason: str) -> None:
