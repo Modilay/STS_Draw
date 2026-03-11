@@ -588,6 +588,11 @@ class MainWindowFactory:
                 try:
                     self._sync_runtime_inputs_to_controller()
                     controller.generate_line_art()
+                    if controller.session.line_art is not None and controller.session.image_path:
+                        controller.image_generation_client.save_cached_line_art(
+                            controller.session.image_path,
+                            controller.session.line_art,
+                        )
                 except Exception as exc:  # pragma: no cover
                     self.line_art_generation_failed.emit(self._format_error(exc))
                     return
@@ -884,9 +889,38 @@ class MainWindowFactory:
                 if not controller.session.image_path:
                     self.status_value_label.setText(self._format_error(RuntimeError("No image has been selected.")))
                     return
+                self._sync_runtime_inputs_to_controller()
+                cached_line_art = controller.image_generation_client.get_cached_line_art(controller.session.image_path)
+                if cached_line_art is not None:
+                    action = self._prompt_for_cached_line_art()
+                    if action == "use":
+                        controller.session.line_art = cached_line_art
+                        self._on_line_art_generation_succeeded(cached_line_art)
+                        return
+                    if action == "cancel":
+                        self.status_value_label.setText("已取消生成线稿")
+                        return
                 self._on_line_art_generation_busy(True)
                 self._line_art_thread = threading.Thread(target=self._run_line_art_generation, daemon=True)
                 self._line_art_thread.start()
+
+            def _prompt_for_cached_line_art(self) -> str:
+                message_box = QtWidgets.QMessageBox(self)
+                message_box.setIcon(QtWidgets.QMessageBox.Question)
+                message_box.setWindowTitle("发现缓存")
+                message_box.setText("检测到这张图片已有缓存线稿，是否使用缓存？")
+                use_button = message_box.addButton("使用缓存", QtWidgets.QMessageBox.AcceptRole)
+                regenerate_button = message_box.addButton("重新生成", QtWidgets.QMessageBox.ActionRole)
+                cancel_button = message_box.addButton("取消", QtWidgets.QMessageBox.RejectRole)
+                message_box.setDefaultButton(use_button)
+                message_box.exec()
+
+                clicked_button = message_box.clickedButton()
+                if clicked_button is regenerate_button:
+                    return "regenerate"
+                if clicked_button is cancel_button:
+                    return "cancel"
+                return "use"
 
             def _preview(self) -> None:
                 if controller.session.line_art is None:

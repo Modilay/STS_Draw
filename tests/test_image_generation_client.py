@@ -1,5 +1,7 @@
 import base64
+import hashlib
 import os
+import shutil
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -13,6 +15,7 @@ from sts_draw.image_generation_client import (
     OpenAICompatibleClient,
     OpenAICompatibleSettings,
 )
+from sts_draw.models import LineArtResult
 
 
 PNG_BYTES = base64.b64decode(
@@ -41,8 +44,7 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.temp_dir.mkdir(exist_ok=True)
 
     def tearDown(self) -> None:
-        for path in self.temp_dir.glob("*"):
-            path.unlink()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_defaults_to_openrouter_configuration(self) -> None:
         client = OpenAICompatibleClient(settings=OpenAICompatibleSettings())
@@ -62,6 +64,62 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             client = OpenAICompatibleClient()
 
         self.assertEqual(client.settings.proxy_url, "http://127.0.0.1:7890")
+
+    def test_get_cached_line_art_returns_none_when_cache_missing(self) -> None:
+        image_path = self.temp_dir / "source.png"
+        image_path.write_bytes(PNG_BYTES)
+        client = OpenAICompatibleClient(settings=OpenAICompatibleSettings(api_key="test-key"))
+
+        with patch("sts_draw.image_generation_client.default_settings_path", return_value=self.temp_dir / "settings.json", create=True):
+            self.assertTrue(hasattr(client, "get_cached_line_art"))
+            self.assertIsNone(client.get_cached_line_art(str(image_path)))
+
+    def test_save_cached_line_art_persists_and_loads_cached_result(self) -> None:
+        image_path = self.temp_dir / "source.png"
+        image_path.write_bytes(PNG_BYTES)
+        client = OpenAICompatibleClient(settings=OpenAICompatibleSettings(api_key="test-key"))
+        line_art = LineArtResult(image_bytes=PNG_BYTES, mime_type="image/png", width=2, height=3, prompt="ignored")
+
+        with patch("sts_draw.image_generation_client.default_settings_path", return_value=self.temp_dir / "settings.json", create=True):
+            self.assertTrue(hasattr(client, "save_cached_line_art"))
+            self.assertTrue(hasattr(client, "get_cached_line_art"))
+            client.save_cached_line_art(str(image_path), line_art)
+            cached = client.get_cached_line_art(str(image_path))
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.image_bytes, PNG_BYTES)
+        self.assertEqual(cached.size, (2, 3))
+        self.assertEqual(cached.prompt, DEFAULT_PROMPT)
+
+    def test_same_image_bytes_hit_same_cache_across_different_paths(self) -> None:
+        first_path = self.temp_dir / "source-a.png"
+        second_path = self.temp_dir / "source-b.png"
+        first_path.write_bytes(PNG_BYTES)
+        second_path.write_bytes(PNG_BYTES)
+        client = OpenAICompatibleClient(settings=OpenAICompatibleSettings(api_key="test-key"))
+        line_art = LineArtResult(image_bytes=PNG_BYTES, mime_type="image/png", width=2, height=3)
+
+        with patch("sts_draw.image_generation_client.default_settings_path", return_value=self.temp_dir / "settings.json", create=True):
+            self.assertTrue(hasattr(client, "save_cached_line_art"))
+            self.assertTrue(hasattr(client, "get_cached_line_art"))
+            client.save_cached_line_art(str(first_path), line_art)
+            cached = client.get_cached_line_art(str(second_path))
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.image_bytes, PNG_BYTES)
+
+    def test_get_cached_line_art_ignores_corrupt_cache_file(self) -> None:
+        image_path = self.temp_dir / "source.png"
+        image_path.write_bytes(PNG_BYTES)
+        client = OpenAICompatibleClient(settings=OpenAICompatibleSettings(api_key="test-key"))
+        cache_dir = self.temp_dir / "line_art_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha256(PNG_BYTES).hexdigest()
+        (cache_dir / f"{cache_key}.png").write_bytes(b"not-a-png")
+
+        with patch("sts_draw.image_generation_client.default_settings_path", return_value=self.temp_dir / "settings.json", create=True):
+            self.assertTrue(hasattr(client, "get_cached_line_art"))
+            self.assertIsNone(client.get_cached_line_art(str(image_path)))
 
     def test_sends_openrouter_chat_completion_request(self) -> None:
         image_path = self.temp_dir / "source.png"

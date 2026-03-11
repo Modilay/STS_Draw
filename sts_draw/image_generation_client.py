@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -13,15 +14,14 @@ from sts_draw.models import LineArtResult
 DEFAULT_PROMPT = """
 请将输入图像转换为单线条骨架图（Centerline Drawing），目标是提取适合绘制的矢量路径。
 
-要求：
-- 保持原比例和大小
-- 只保留黑色线条与白色背景
-- 全图线条粗细尽量统一
-- 仅保留外轮廓、五官、关键配饰和必要结构线
-- 忽略浅色细节、弱对比细节、花纹、阴影、颜色分区和装饰性纹理
-- 禁止实心填充、排线、灰度、渐变
-- 线条尽量少，但必须保证主体可识别
-- 输出应适合后续转换为路径并进行画布绘制
+技术执行要求：
+
+单线渲染： 仅勾勒物体中心路径，绝对禁止将色块的“内外边缘”同时提取形成双线。忽略一切填充区域的轮廓。
+线条逻辑： 将图像理解为由一维线条构成的图形，而非二维色块的边缘组合。
+极简处理： 仅保留表达主体结构的极少量线条。对于粗笔触区域，只取其中心轨迹，不取其填充边界。
+风格统一： 全图保持统一的单像素级线条粗细，不随原图笔触动态变化。
+排除干扰： 彻底忽略肤色分区线、无结构意义的平滑过渡线、阴影边缘、非结构性色块边缘。
+输出规范： 输出纯黑线条（#000000）与纯白背景（#FFFFFF），完全二值化，无灰度、无抗锯齿模糊。
 """.strip()
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -62,6 +62,33 @@ class OpenAICompatibleClient:
             height=height,
             prompt=prompt or DEFAULT_PROMPT,
         )
+
+    def get_cached_line_art(self, image_path: str) -> LineArtResult | None:
+        try:
+            source_bytes = Path(image_path).read_bytes()
+            cached_bytes = _line_art_cache_path(source_bytes).read_bytes()
+        except OSError:
+            return None
+
+        width, height = _probe_png_size(cached_bytes)
+        if width <= 0 or height <= 0:
+            return None
+        return LineArtResult(
+            image_bytes=cached_bytes,
+            mime_type="image/png",
+            width=width,
+            height=height,
+            prompt=DEFAULT_PROMPT,
+        )
+
+    def save_cached_line_art(self, image_path: str, line_art: LineArtResult) -> None:
+        try:
+            source_bytes = Path(image_path).read_bytes()
+            cache_path = _line_art_cache_path(source_bytes)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(line_art.image_bytes)
+        except OSError:
+            return
 
     def _build_payload(self, image_path: str, image_bytes: bytes, prompt: str) -> dict[str, object]:
         mime_type = _guess_mime_type(image_path)
@@ -194,6 +221,20 @@ def _env_first(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def default_settings_path() -> Path:
+    from sts_draw.user_settings import default_settings_path as user_default_settings_path
+
+    return user_default_settings_path()
+
+
+def _line_art_cache_path(source_bytes: bytes) -> Path:
+    return default_settings_path().parent / "line_art_cache" / f"{_cache_key(source_bytes)}.png"
+
+
+def _cache_key(source_bytes: bytes) -> str:
+    return hashlib.sha256(source_bytes).hexdigest()
 
 
 def _guess_mime_type(image_path: str) -> str:

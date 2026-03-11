@@ -333,6 +333,87 @@ class MainWindowFactoryTests(unittest.TestCase):
         generator.finish.set()
         self._wait_for(lambda: window._line_art_thread is None, timeout=1)
 
+    def test_generate_line_art_uses_cached_result_without_starting_request(self) -> None:
+        window = self._build_window()
+        controller = window._controller
+        controller.load_image('image.png')
+        cached_line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        generator = FakeLineArtGenerator(LineArtResult(self.png_bytes, 'image/png', 8, 8))
+        generator.finish.set()
+        controller.generate_line_art = generator
+        controller.image_generation_client.get_cached_line_art = lambda _image_path: cached_line_art
+        window._prompt_for_cached_line_art = lambda: 'use'
+
+        window._generate_line_art()
+        self.qt_app.processEvents()
+
+        self.assertEqual(generator.calls, 0)
+        self.assertIs(controller.session.line_art, cached_line_art)
+        self.assertIsNone(window._line_art_thread)
+        pixmap = window.line_art_preview_label.pixmap()
+        self.assertIsNotNone(pixmap)
+        self.assertFalse(pixmap.isNull())
+
+    def test_generate_line_art_cache_hit_can_regenerate_and_overwrite_cache(self) -> None:
+        window = self._build_window()
+        controller = window._controller
+        controller.load_image('image.png')
+        cached_line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        generated_line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        generator = FakeLineArtGenerator(generated_line_art)
+        prompt_calls = []
+        save_calls = []
+
+        def generate() -> None:
+            generator()
+            controller.session.line_art = generated_line_art
+
+        controller.generate_line_art = generate
+        controller.image_generation_client.get_cached_line_art = lambda _image_path: cached_line_art
+        controller.image_generation_client.save_cached_line_art = (
+            lambda image_path, line_art: save_calls.append((image_path, line_art))
+        )
+        window._prompt_for_cached_line_art = lambda: prompt_calls.append('prompted') or 'regenerate'
+
+        window._generate_line_art()
+
+        self.assertTrue(generator.started.wait(timeout=1))
+        generator.finish.set()
+        self._wait_for(lambda: window._line_art_thread is None, timeout=1)
+        self.assertEqual(prompt_calls, ['prompted'])
+        self.assertEqual(generator.calls, 1)
+        self.assertEqual(save_calls, [('image.png', generated_line_art)])
+        self.assertIs(controller.session.line_art, generated_line_art)
+
+    def test_generate_line_art_cache_hit_can_cancel_without_changing_existing_state(self) -> None:
+        window = self._build_window()
+        controller = window._controller
+        controller.load_image('image.png')
+        existing_line_art = LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        existing_region = CalibrationRegion(1, 2, 3, 4)
+        existing_preview = {'segment_count': 2}
+        controller.session.line_art = existing_line_art
+        controller.session.active_region = existing_region
+        controller.session.stroke_plan = self._make_stroke_plan()
+        controller.session.last_preview = existing_preview
+        generator = FakeLineArtGenerator(LineArtResult(self.png_bytes, 'image/png', 8, 8))
+        generator.finish.set()
+        controller.generate_line_art = generator
+        controller.image_generation_client.get_cached_line_art = (
+            lambda _image_path: LineArtResult(self.png_bytes, 'image/png', 8, 8)
+        )
+        window._prompt_for_cached_line_art = lambda: 'cancel'
+
+        window._generate_line_art()
+        self.qt_app.processEvents()
+
+        self.assertEqual(generator.calls, 0)
+        self.assertIs(controller.session.line_art, existing_line_art)
+        self.assertEqual(controller.session.active_region, existing_region)
+        self.assertEqual(controller.session.last_preview, existing_preview)
+        self.assertIsNone(window._line_art_thread)
+        self.assertEqual(window.status_value_label.text(), '已取消生成线稿')
+
     def test_window_restores_saved_runtime_settings(self) -> None:
         from sts_draw import draw_executor
         from sts_draw.user_settings import UserSettings, UserSettingsStore
