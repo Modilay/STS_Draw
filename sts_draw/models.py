@@ -72,6 +72,14 @@ class StrokePlan:
 
 
 @dataclass(slots=True)
+class HotkeyStatus:
+    hotkey: str
+    is_active: bool = True
+    conflict_reason: str | None = None
+    message: str = "active"
+
+
+@dataclass(slots=True)
 class ExecutionSession:
     status: str = "idle"
     error_reason: str | None = None
@@ -81,6 +89,12 @@ class ExecutionSession:
     line_art: LineArtResult | None = None
     image_path: str | None = None
     hotkeys: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_HOTKEYS))
+    hotkey_statuses: dict[str, HotkeyStatus] = field(
+        default_factory=lambda: {
+            action: HotkeyStatus(hotkey=value)
+            for action, value in DEFAULT_HOTKEYS.items()
+        }
+    )
     draw_mouse_button: str = DEFAULT_DRAW_MOUSE_BUTTON
     preview_scale: float | None = None
 

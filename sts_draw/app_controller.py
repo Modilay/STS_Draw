@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sts_draw.draw_executor import DrawExecutor
@@ -81,10 +82,10 @@ class AppController:
         self.session.status = "ready"
         return preview
 
-    def start_drawing(self) -> None:
+    def start_drawing(self, status_callback: Callable[[str], None] | None = None) -> None:
         if self.session.stroke_plan is None:
             raise RuntimeError("Preview must be prepared first.")
-        self.draw_executor.start(self.session)
+        self.draw_executor.start(self.session, status_callback=status_callback)
 
     def cancel(self) -> None:
         self.draw_executor.cancel()

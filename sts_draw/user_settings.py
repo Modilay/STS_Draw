@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sts_draw.image_generation_client import DEFAULT_BASE_URL, DEFAULT_MODEL
 from sts_draw.models import DEFAULT_DRAW_MOUSE_BUTTON, DEFAULT_HOTKEYS, ExecutionSession
 
 
@@ -12,10 +13,17 @@ from sts_draw.models import DEFAULT_DRAW_MOUSE_BUTTON, DEFAULT_HOTKEYS, Executio
 class UserSettings:
     hotkeys: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_HOTKEYS))
     draw_mouse_button: str = DEFAULT_DRAW_MOUSE_BUTTON
+    api_key: str = ""
+    proxy_url: str | None = None
+    model: str = DEFAULT_MODEL
+    base_url: str = DEFAULT_BASE_URL
 
     @classmethod
     def from_session(cls, session: ExecutionSession) -> "UserSettings":
-        return cls(hotkeys=dict(session.hotkeys), draw_mouse_button=_normalize_mouse_button(session.draw_mouse_button))
+        return cls(
+            hotkeys=dict(session.hotkeys),
+            draw_mouse_button=_normalize_mouse_button(session.draw_mouse_button),
+        )
 
 
 class UserSettingsStore:
@@ -38,6 +46,10 @@ class UserSettingsStore:
                 {
                     "hotkeys": dict(settings.hotkeys),
                     "draw_mouse_button": _normalize_mouse_button(settings.draw_mouse_button),
+                    "api_key": settings.api_key.strip(),
+                    "proxy_url": _normalize_optional_string(settings.proxy_url),
+                    "model": _normalize_required_string(settings.model, DEFAULT_MODEL),
+                    "base_url": _normalize_required_string(settings.base_url, DEFAULT_BASE_URL),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -69,6 +81,10 @@ def _settings_from_payload(payload: object) -> UserSettings:
     return UserSettings(
         hotkeys=hotkeys,
         draw_mouse_button=_normalize_mouse_button(payload.get("draw_mouse_button")),
+        api_key=_normalize_optional_string(payload.get("api_key")) or "",
+        proxy_url=_normalize_optional_string(payload.get("proxy_url")),
+        model=_normalize_required_string(payload.get("model"), DEFAULT_MODEL),
+        base_url=_normalize_required_string(payload.get("base_url"), DEFAULT_BASE_URL),
     )
 
 
@@ -76,3 +92,15 @@ def _normalize_mouse_button(value: object) -> str:
     if isinstance(value, str) and value.lower() == "right":
         return "right"
     return DEFAULT_DRAW_MOUSE_BUTTON
+
+
+def _normalize_optional_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_required_string(value: object, default: str) -> str:
+    normalized = _normalize_optional_string(value)
+    return normalized or default

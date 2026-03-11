@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
 from sts_draw.app_controller import AppController
 from sts_draw.canvas_calibrator import CanvasCalibrator
-from sts_draw.global_hotkeys import GlobalHotkeyManager
+from sts_draw.global_hotkeys import GlobalHotkeyManager, HotkeyCheckResult
+from sts_draw.models import HotkeyStatus
 from sts_draw.user_settings import UserSettings, UserSettingsStore
 
 
@@ -27,6 +29,10 @@ class MainWindowFactory:
         saved_settings = settings_store.load()
         controller.session.hotkeys.update(saved_settings.hotkeys)
         controller.session.draw_mouse_button = saved_settings.draw_mouse_button
+        controller.image_generation_client.settings.api_key = saved_settings.api_key
+        controller.image_generation_client.settings.proxy_url = saved_settings.proxy_url
+        controller.image_generation_client.settings.model = saved_settings.model
+        controller.image_generation_client.settings.base_url = saved_settings.base_url
 
         class ClickablePreviewLabel(QtWidgets.QLabel):
             clicked = QtCore.Signal()
@@ -38,6 +44,12 @@ class MainWindowFactory:
 
         class MainWindow(QtWidgets.QMainWindow):
             hotkey_action_requested = QtCore.Signal(str)
+            execution_status_changed = QtCore.Signal(str)
+            execution_error = QtCore.Signal(str)
+            line_art_generation_busy = QtCore.Signal(bool)
+            line_art_generation_succeeded = QtCore.Signal(object)
+            line_art_generation_failed = QtCore.Signal(str)
+
             def __init__(self) -> None:
                 super().__init__()
                 self.setWindowTitle("STS 绘图助手")
@@ -48,6 +60,8 @@ class MainWindowFactory:
                 self._original_pixmap: QtGui.QPixmap | None = None
                 self._line_art_pixmap: QtGui.QPixmap | None = None
                 self._recording_hotkey_name: str | None = None
+                self._draw_thread: threading.Thread | None = None
+                self._line_art_thread: threading.Thread | None = None
                 self._hotkey_titles = {
                     "calibrate": "定位预览",
                     "start": "开始绘制",
@@ -62,8 +76,17 @@ class MainWindowFactory:
 
                 self._apply_styles()
                 self.hotkey_action_requested.connect(self._handle_hotkey_action)
+                self.execution_status_changed.connect(self._on_execution_status_changed)
+                self.execution_error.connect(self._on_execution_error)
+                self.line_art_generation_busy.connect(self._on_line_art_generation_busy)
+                self.line_art_generation_succeeded.connect(self._on_line_art_generation_succeeded)
+                self.line_art_generation_failed.connect(self._on_line_art_generation_failed)
 
-                self.preview_panel = self._create_card("preview_panel", "图片预览", "上方直接对比原图与线稿效果。")
+                self.preview_panel = self._create_card(
+                    "preview_panel",
+                    "图片预览",
+                    "上方直接对比原图与线稿效果。",
+                )
                 preview_layout = QtWidgets.QHBoxLayout()
                 preview_layout.setSpacing(16)
                 self.preview_panel.layout().addLayout(preview_layout)
@@ -82,17 +105,26 @@ class MainWindowFactory:
                 preview_layout.addWidget(original_card, 1)
                 preview_layout.addWidget(line_art_card, 1)
 
-                self.control_panel = self._create_card("control_panel", "控制面板", "下方完成配置、生成、校准和绘制。")
+                self.control_panel = self._create_card(
+                    "control_panel",
+                    "控制面板",
+                    "下方完成配置、生成、校准和绘制。",
+                )
                 control_layout = QtWidgets.QHBoxLayout()
                 control_layout.setSpacing(16)
                 self.control_panel.layout().addLayout(control_layout)
 
-                config_card = self._create_card("config_panel", "模型配置", "导入图片后即可生成线稿。")
+                config_card = self._create_card(
+                    "config_panel",
+                    "模型配置",
+                    "导入图片后即可生成线稿。",
+                )
                 self.image_name_value_label = QtWidgets.QLabel("未选择图片")
                 self.image_name_value_label.setObjectName("image_name_value")
                 self.api_key_input = QtWidgets.QLineEdit()
                 self.api_key_input.setPlaceholderText("输入 OpenRouter 或兼容服务的 API Key")
                 self.api_key_input.setEchoMode(QtWidgets.QLineEdit.Password)
+                self.api_key_input.setText(controller.image_generation_client.settings.api_key or "")
                 self.model_input = QtWidgets.QLineEdit()
                 self.model_input.setPlaceholderText("输入模型名称")
                 self.model_input.setText(controller.image_generation_client.settings.model)
@@ -106,6 +138,7 @@ class MainWindowFactory:
                 self.fill_proxy_button.setObjectName("compact_button")
                 self.hotkey_value_labels: dict[str, QtWidgets.QLabel] = {}
                 self.hotkey_record_buttons: dict[str, QtWidgets.QPushButton] = {}
+                self.hotkey_status_labels: dict[str, QtWidgets.QLabel] = {}
                 self.mouse_button_combo = QtWidgets.QComboBox()
                 self.mouse_button_combo.addItem("左键", "left")
                 self.mouse_button_combo.addItem("右键", "right")
@@ -138,7 +171,12 @@ class MainWindowFactory:
                 form_layout.addRow("代理地址", proxy_row)
                 config_card.layout().addLayout(form_layout)
                 config_card.layout().addStretch(1)
-                self.shortcut_card = self._create_card("shortcut_panel", "快捷与绘制", "在这里调整全局热键和绘制按键。")
+
+                self.shortcut_card = self._create_card(
+                    "shortcut_panel",
+                    "快捷与绘制",
+                    "在这里调整全局热键和绘制按键。",
+                )
                 hotkey_form = QtWidgets.QFormLayout()
                 hotkey_form.setLabelAlignment(QtCore.Qt.AlignLeft)
                 hotkey_form.setFormAlignment(QtCore.Qt.AlignTop)
@@ -147,23 +185,33 @@ class MainWindowFactory:
                 for action in ("calibrate", "start", "stop"):
                     value_label = QtWidgets.QLabel()
                     value_label.setObjectName("hotkey_value")
+                    status_label = QtWidgets.QLabel()
+                    status_label.setObjectName("hotkey_status")
                     button = QtWidgets.QPushButton("设置")
                     button.setObjectName("compact_button")
-                    button.clicked.connect(lambda _checked=False, name=action: self._begin_hotkey_recording(name))
+                    button.clicked.connect(
+                        lambda _checked=False, name=action: self._begin_hotkey_recording(name)
+                    )
                     row_widget = QtWidgets.QWidget()
                     row_layout = QtWidgets.QHBoxLayout(row_widget)
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(8)
-                    row_layout.addWidget(value_label, 1)
+                    row_layout.addWidget(value_label, 2)
+                    row_layout.addWidget(status_label, 1)
                     row_layout.addWidget(button)
                     hotkey_form.addRow(self._hotkey_titles[action], row_widget)
                     self.hotkey_value_labels[action] = value_label
                     self.hotkey_record_buttons[action] = button
+                    self.hotkey_status_labels[action] = status_label
                 hotkey_form.addRow("绘画按键", self.mouse_button_combo)
                 self.shortcut_card.layout().addLayout(hotkey_form)
                 self.shortcut_card.layout().addStretch(1)
 
-                actions_card = self._create_card("actions_panel", "操作", "生成线稿后定位预览，再开始绘制。")
+                actions_card = self._create_card(
+                    "actions_panel",
+                    "操作",
+                    "生成线稿后定位预览，再开始绘制。",
+                )
                 actions_grid = QtWidgets.QGridLayout()
                 actions_grid.setHorizontalSpacing(10)
                 actions_grid.setVerticalSpacing(10)
@@ -175,13 +223,19 @@ class MainWindowFactory:
                 actions_grid.addWidget(self.preview_button, 0, 1)
                 actions_grid.addWidget(self.start_button, 1, 0, 1, 2)
                 actions_card.layout().addLayout(actions_grid)
-                hint_label = QtWidgets.QLabel("点击原图预览可选择图片，Ctrl+V 可直接粘贴；定位预览时滚轮缩放。")
+                hint_label = QtWidgets.QLabel(
+                    "点击原图预览可选择图片，Ctrl+V 可直接粘贴；定位预览时滚轮缩放。"
+                )
                 hint_label.setObjectName("hint_label")
                 hint_label.setWordWrap(True)
                 actions_card.layout().addWidget(hint_label)
                 actions_card.layout().addStretch(1)
 
-                status_card = self._create_card("status_panel", "状态", "查看当前导入、线稿和预览状态。")
+                status_card = self._create_card(
+                    "status_panel",
+                    "状态",
+                    "查看当前导入、线稿和预览状态。",
+                )
                 status_layout = QtWidgets.QFormLayout()
                 status_layout.setLabelAlignment(QtCore.Qt.AlignLeft)
                 status_layout.setFormAlignment(QtCore.Qt.AlignTop)
@@ -212,6 +266,10 @@ class MainWindowFactory:
                 self.preview_button.clicked.connect(self._preview)
                 self.start_button.clicked.connect(self._start)
                 self.fill_proxy_button.clicked.connect(self._fill_local_proxy)
+                self.api_key_input.textChanged.connect(self._on_runtime_text_changed)
+                self.model_input.textChanged.connect(self._on_runtime_text_changed)
+                self.base_url_input.textChanged.connect(self._on_runtime_text_changed)
+                self.proxy_input.textChanged.connect(self._on_runtime_text_changed)
                 self.mouse_button_combo.currentIndexChanged.connect(self._on_draw_mouse_button_changed)
                 self._refresh_hotkey_labels()
 
@@ -250,7 +308,7 @@ class MainWindowFactory:
                     self._refresh_hotkey_labels()
                     self._save_runtime_settings()
                     self._register_hotkeys()
-                    self._finish_hotkey_recording(self._hotkey_update_status(action, hotkey))
+                    self._finish_hotkey_recording(self._hotkey_update_status(action))
                     event.accept()
                     return
                 super().keyPressEvent(event)
@@ -341,15 +399,22 @@ class MainWindowFactory:
             def _refresh_hotkey_labels(self) -> None:
                 for action, label in self.hotkey_value_labels.items():
                     label.setText(self._format_hotkey_display(controller.session.hotkeys[action]))
+                    self._render_hotkey_status(action)
 
             def _register_hotkeys(self) -> None:
-                self._hotkeys_manager.register(
+                results = self._hotkeys_manager.register(
                     {
                         controller.session.hotkeys["calibrate"]: lambda: self._queue_hotkey_action("calibrate"),
                         controller.session.hotkeys["start"]: lambda: self._queue_hotkey_action("start"),
-                        controller.session.hotkeys["stop"]: lambda: self._queue_hotkey_action("stop"),
+                        controller.session.hotkeys["stop"]: self._stop_from_hotkey,
                     }
                 )
+                for action, hotkey in controller.session.hotkeys.items():
+                    result = results.get(hotkey) if isinstance(results, dict) else None
+                    if result is None:
+                        result = HotkeyCheckResult(hotkey=hotkey, ok=True)
+                    self._set_hotkey_status(action, result)
+                self._refresh_hotkey_labels()
 
             def _queue_hotkey_action(self, action: str) -> None:
                 self.hotkey_action_requested.emit(action)
@@ -362,17 +427,123 @@ class MainWindowFactory:
                     self._start()
                     return
                 if action == "stop":
-                    controller.cancel()
+                    self._request_stop()
 
-            def _hotkey_update_status(self, action: str, hotkey: str) -> str:
-                status = f"已更新{self._hotkey_titles[action]}热键"
-                hotkey_parts = set(hotkey.split("+"))
-                if {"alt", "shift"}.issubset(hotkey_parts):
-                    status += "；注意 Alt+Shift 可能与系统输入法或键盘布局切换冲突"
-                return status
+            def _stop_from_hotkey(self) -> None:
+                self._request_stop()
+
+            def _request_stop(self) -> None:
+                controller.cancel()
+                self.execution_status_changed.emit(controller.session.status)
+
+            def _run_drawing(self) -> None:
+                try:
+                    controller.start_drawing(status_callback=self.execution_status_changed.emit)
+                except Exception as exc:  # pragma: no cover
+                    self.execution_error.emit(self._format_error(exc))
+
+            def _run_line_art_generation(self) -> None:
+                self.line_art_generation_busy.emit(True)
+                try:
+                    self._sync_runtime_inputs_to_controller()
+                    controller.generate_line_art()
+                except Exception as exc:  # pragma: no cover
+                    self.line_art_generation_failed.emit(self._format_error(exc))
+                    return
+                self.line_art_generation_succeeded.emit(controller.session.line_art)
+
+            def _set_line_art_generation_controls_enabled(self, enabled: bool) -> None:
+                self.line_art_button.setEnabled(enabled)
+                self.preview_button.setEnabled(enabled)
+                self.start_button.setEnabled(enabled)
+
+            def _on_line_art_generation_busy(self, is_busy: bool) -> None:
+                self._set_line_art_generation_controls_enabled(not is_busy)
+                if is_busy:
+                    self.status_value_label.setText("正在生成线稿...")
+
+            def _on_line_art_generation_succeeded(self, line_art) -> None:
+                self._line_art_thread = None
+                self._set_line_art_generation_controls_enabled(True)
+                if line_art is not None:
+                    self._set_line_art_preview(line_art)
+                controller.session.active_region = None
+                controller.session.stroke_plan = None
+                controller.session.last_preview = None
+                self.status_value_label.setText("线稿已生成")
+                self.region_value_label.setText("未选择")
+                self.preview_value_label.setText("待生成")
+
+            def _on_line_art_generation_failed(self, message: str) -> None:
+                self._line_art_thread = None
+                self._set_line_art_generation_controls_enabled(True)
+                self.status_value_label.setText(message)
+
+            def _on_execution_status_changed(self, status: str) -> None:
+                status_map = {
+                    "countdown": "倒计时中",
+                    "running": "正在绘制",
+                    "cancelled": "已停止",
+                    "completed": "绘制完成",
+                }
+                self.status_value_label.setText(status_map.get(status, status))
+                if status in {"cancelled", "completed"}:
+                    self._draw_thread = None
+
+            def _on_execution_error(self, message: str) -> None:
+                self.status_value_label.setText(message)
+                self._draw_thread = None
+
+            def _hotkey_update_status(self, action: str) -> str:
+                status = controller.session.hotkey_statuses[action]
+                if status.is_active:
+                    text = f"已更新{self._hotkey_titles[action]}热键"
+                else:
+                    text = f"已保存{self._hotkey_titles[action]}热键，但当前未生效：{status.message}"
+                hotkey_parts = set(status.hotkey.split("+"))
+                if status.is_active and {"alt", "shift"}.issubset(hotkey_parts):
+                    text += "；注意 Alt+Shift 可能与系统输入法或键盘布局切换冲突"
+                return text
+
+            def _set_hotkey_status(self, action: str, result: HotkeyCheckResult) -> None:
+                controller.session.hotkey_statuses[action] = HotkeyStatus(
+                    hotkey=result.hotkey,
+                    is_active=result.ok,
+                    conflict_reason=result.conflict_reason,
+                    message="正常" if result.ok else f"未生效：{result.message}",
+                )
+
+            def _render_hotkey_status(self, action: str) -> None:
+                status = controller.session.hotkey_statuses[action]
+                label = self.hotkey_status_labels[action]
+                label.setText(status.message)
+                label.setProperty("active", status.is_active)
+                self.style().unpolish(label)
+                self.style().polish(label)
+                label.update()
 
             def _save_runtime_settings(self) -> None:
-                self._settings_store.save(UserSettings.from_session(controller.session))
+                self._settings_store.save(self._current_user_settings())
+
+            def _current_user_settings(self) -> UserSettings:
+                return UserSettings(
+                    hotkeys=dict(controller.session.hotkeys),
+                    draw_mouse_button=controller.session.draw_mouse_button,
+                    api_key=self.api_key_input.text().strip(),
+                    proxy_url=self.proxy_input.text().strip() or None,
+                    model=self.model_input.text().strip(),
+                    base_url=self.base_url_input.text().strip(),
+                )
+
+            def _sync_runtime_inputs_to_controller(self) -> None:
+                controller.image_generation_client.settings.api_key = self.api_key_input.text().strip()
+                controller.image_generation_client.settings.model = self.model_input.text().strip()
+                controller.image_generation_client.settings.base_url = self.base_url_input.text().strip()
+                controller.image_generation_client.settings.proxy_url = self.proxy_input.text().strip() or None
+
+            def _on_runtime_text_changed(self, _value: str) -> None:
+                self._sync_runtime_inputs_to_controller()
+                self._save_runtime_settings()
 
             def _on_draw_mouse_button_changed(self, _index=None) -> None:
                 controller.session.draw_mouse_button = self.mouse_button_combo.currentData()
@@ -460,24 +631,15 @@ class MainWindowFactory:
                 self.status_value_label.setText("已从剪贴板导入图片" if from_clipboard else "已载入图片")
 
             def _generate_line_art(self) -> None:
-                controller.image_generation_client.settings.api_key = self.api_key_input.text().strip()
-                controller.image_generation_client.settings.model = self.model_input.text().strip()
-                controller.image_generation_client.settings.base_url = self.base_url_input.text().strip()
-                controller.image_generation_client.settings.proxy_url = self.proxy_input.text().strip() or None
-                try:
-                    controller.generate_line_art()
-                except Exception as exc:  # pragma: no cover
-                    self.status_value_label.setText(self._format_error(exc))
+                if self._line_art_thread is not None and self._line_art_thread.is_alive():
+                    self.status_value_label.setText("正在生成线稿...")
                     return
-
-                if controller.session.line_art is not None:
-                    self._set_line_art_preview(controller.session.line_art)
-                controller.session.active_region = None
-                controller.session.stroke_plan = None
-                controller.session.last_preview = None
-                self.status_value_label.setText("线稿已生成")
-                self.region_value_label.setText("未选择")
-                self.preview_value_label.setText("待生成")
+                if not controller.session.image_path:
+                    self.status_value_label.setText(self._format_error(RuntimeError("No image has been selected.")))
+                    return
+                self._on_line_art_generation_busy(True)
+                self._line_art_thread = threading.Thread(target=self._run_line_art_generation, daemon=True)
+                self._line_art_thread.start()
 
             def _preview(self) -> None:
                 if controller.session.line_art is None:
@@ -509,11 +671,11 @@ class MainWindowFactory:
                 self.preview_value_label.setText(f"{segment_count or 0} 段路径")
 
             def _start(self) -> None:
-                try:
-                    controller.start_drawing()
-                except Exception as exc:  # pragma: no cover
-                    self.status_value_label.setText(self._format_error(exc))
+                if self._draw_thread is not None and self._draw_thread.is_alive():
+                    self.status_value_label.setText("正在绘制")
                     return
+                self._draw_thread = threading.Thread(target=self._run_drawing, daemon=True)
+                self._draw_thread.start()
                 self.status_value_label.setText("正在绘制")
 
             def closeEvent(self, event) -> None:
@@ -536,7 +698,13 @@ class MainWindowFactory:
                 card_layout.addWidget(subtitle_label)
                 return card
 
-            def _create_preview_card(self, title: str, preview_object_name: str, empty_text: str, clickable: bool = False):
+            def _create_preview_card(
+                self,
+                title: str,
+                preview_object_name: str,
+                empty_text: str,
+                clickable: bool = False,
+            ):
                 card = QtWidgets.QFrame()
                 card.setObjectName("preview_card")
                 card_layout = QtWidgets.QVBoxLayout(card)
@@ -587,7 +755,11 @@ class MainWindowFactory:
                     self._update_preview_label(self.line_art_preview_label, self._line_art_pixmap)
 
             def _update_preview_label(self, label, pixmap) -> None:
-                scaled = pixmap.scaled(label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                scaled = pixmap.scaled(
+                    label.size(),
+                    QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation,
+                )
                 label.setPixmap(scaled)
 
             def _format_error(self, exc: Exception) -> str:
@@ -606,7 +778,8 @@ class MainWindowFactory:
                     """
                     QMainWindow { background: #f5f1ea; }
                     QFrame#preview_panel, QFrame#control_panel, QFrame#config_panel,
-                    QFrame#actions_panel, QFrame#status_panel, QFrame#preview_card {
+                    QFrame#actions_panel, QFrame#status_panel, QFrame#preview_card,
+                    QFrame#shortcut_panel {
                         background: #fffdf9;
                         border: 1px solid #e6dfd4;
                         border-radius: 18px;
@@ -625,19 +798,26 @@ class MainWindowFactory:
                         font-weight: 600;
                         color: #6b594d;
                     }
-                    QLabel#image_name_value {
-                        min-height: 38px;
-                        padding: 8px 12px;
-                        background: #f6efe5;
-                        border: 1px solid #e5d9c9;
-                        border-radius: 12px;
-                    }
+                    QLabel#image_name_value,
                     QLabel#hotkey_value {
                         min-height: 38px;
                         padding: 8px 12px;
                         background: #f6efe5;
                         border: 1px solid #e5d9c9;
                         border-radius: 12px;
+                    }
+                    QLabel#hotkey_status {
+                        min-height: 28px;
+                        padding: 4px 10px;
+                        border-radius: 10px;
+                        font-size: 12px;
+                        font-weight: 600;
+                        background: #eef5ee;
+                        color: #2f7d4f;
+                    }
+                    QLabel#hotkey_status[active="false"] {
+                        background: #fdecec;
+                        color: #b13c3c;
                     }
                     QLabel#original_preview, QLabel#line_art_preview {
                         background: #faf6f0;
